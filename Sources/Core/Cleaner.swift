@@ -5,10 +5,13 @@ public struct InstalledApp: Identifiable, Sendable, Hashable {
     public let url: URL
     public let name: String
     public let bundleID: String
+    public var discoveredNames: Set<String> = []
+    public var componentIDs: Set<String> = []
+    public var identityNotes: [String] = []
     public init(url: URL, name: String, bundleID: String) {
         self.url = url.standardizedFileURL; self.name = name; self.bundleID = bundleID
     }
-    public var protected: Bool { (bundleID.hasPrefix("com.apple.") && bundleID != "com.apple.FinalCut") || bundleID == "fr.local.clair" }
+    public var protected: Bool { url.path.hasPrefix("/System/") || url.path.hasPrefix("/Library/Apple/") || bundleID == "fr.local.clair" }
 }
 
 public enum Evidence: String, Sendable {
@@ -111,17 +114,6 @@ public struct Cleaner: Sendable {
          ("Autosave Information", "Sauvegardes automatiques")]
     }
 
-    // Historical product names are clues, never automatic deletion authority.
-    private func aliases(_ app: InstalledApp) -> [String] {
-        switch app.bundleID.lowercased() {
-        case "com.obsproject.obs-studio": return ["obs-studio"]
-        case "com.cisco.webex", "com.cisco.webexmeetingsapp", "com.cisco.webex.cisco-webex-start", "com.cisco.spark":
-            return ["Webex", "Cisco Spark", "Webex Meetings", "Cisco Webex Launcher", "WebEx Folder",
-                    "com.cisco.webex.Cisco-WebEx-Start", "com.cisco.webex.Cisco-WebEx-Start.CWSSafariExtension", "group.com.cisco.webex.meetings"]
-        default: return []
-        }
-    }
-
     // Only exact identifiers, known suffixes, or UUID-suffixed preference files are high confidence.
     public func evidence(for filename: String, app: InstalledApp) -> Evidence? {
         let f = filename.lowercased(), bid = app.bundleID.lowercased()
@@ -133,8 +125,14 @@ public struct Cleaner: Sendable {
             }
             if f.hasPrefix(bid + ".") || f.hasPrefix(bid + "-") { return .possible }
         }
+        for identifier in app.componentIDs where !identifier.isEmpty {
+            let value = identifier.lowercased()
+            if f == value || f == value + ".plist" || f == value + ".savedstate" || f.hasPrefix(value + ".") {
+                return .possible
+            }
+        }
         let stem = URL(fileURLWithPath: filename).deletingPathExtension().lastPathComponent
-        let names = ([app.name, app.url.deletingPathExtension().lastPathComponent] + aliases(app)).map(Self.normalized).filter { $0.count >= 4 }
+        let names = ([app.name, app.url.deletingPathExtension().lastPathComponent] + Array(app.discoveredNames)).map(Self.normalized).filter { $0.count >= 4 }
         if names.contains(Self.normalized(filename)) || names.contains(Self.normalized(stem)) { return .possible }
         return nil
     }
@@ -157,9 +155,10 @@ public struct Cleaner: Sendable {
         return (bytes, incomplete)
     }
 
-    public func scan(_ app: InstalledApp) -> ScanResult {
+    public func scan(_ selectedApp: InstalledApp) -> ScanResult {
+        let app = discoverIdentity(selectedApp)
         let fm = FileManager.default
-        var candidates: [Candidate] = [], warnings: [String] = []
+        var candidates: [Candidate] = [], warnings: [String] = app.identityNotes
         func add(_ url: URL, _ category: String, _ evidence: Evidence, _ reason: String) {
             guard !candidates.contains(where: { $0.url == url }), let stamp = try? Stamp.read(url) else { return }
             let (bytes, incomplete) = measure(url)
@@ -182,12 +181,12 @@ public struct Cleaner: Sendable {
                         if visited > 25_000 { return }
                         let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
                         if values?.isSymbolicLink == true { continue }
-                        if let evidence = evidence(for: url.lastPathComponent, app: app) {
+                        if let match = association(url, app: app) {
+                            let evidence = match.0
                             let shared = relative == "Group Containers"
                             add(url, category, shared ? .shared : evidence,
                                 shared ? "Peut être utilisé par plusieurs applications : suppression désactivée."
-                                : evidence == .identifier ? "Le nom correspond à l’identifiant \(app.bundleID)."
-                                : "Nom proche ou composant dérivé : vérifie son contenu avant de le sélectionner.")
+                                : match.1)
                             continue
                         }
                         // Never descend into an unrelated app sandbox or a shared group.
@@ -215,8 +214,8 @@ public struct Cleaner: Sendable {
                     if visited > 25_000 { warnings.append("Analyse limitée à 25 000 entrées dans \(root.path)."); break }
                     let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
                     if values.isSymbolicLink == true { continue }
-                    if evidence(for: url.lastPathComponent, app: app) != nil {
-                        add(url, "Système", .system, "Composant global : utilise le désinstalleur de l’éditeur. Aucun accès administrateur demandé. Son état d’activation n’est pas vérifié.")
+                    if let match = association(url, app: app) {
+                        add(url, "Système", .system, match.1 + " Composant global : utilise le désinstalleur de l’éditeur. Aucun accès administrateur demandé. Son état d’activation n’est pas vérifié.")
                     } else if depth < 2 && values.isDirectory == true {
                         do { queue += try fm.contentsOfDirectory(at: url, includingPropertiesForKeys: nil).map { ($0, depth + 1) } }
                         catch { warnings.append("Sous-dossier système inaccessible : \(url.path)") }
@@ -242,7 +241,7 @@ public struct Cleaner: Sendable {
         }
         let allowed = locations.filter { $0.0 != "Group Containers" }.map { home.appendingPathComponent("Library/" + $0.0) }
         guard allowed.contains(where: { Self.isWithin(u, $0) }),
-              evidence(for: u.lastPathComponent, app: app) != nil else { throw CleanerError.unsafe(u.path) }
+              association(u, app: app) != nil else { throw CleanerError.unsafe(u.path) }
     }
 
     public func validate(_ candidate: Candidate, app: InstalledApp) throws {
@@ -289,6 +288,8 @@ public struct Cleaner: Sendable {
     public func report(_ result: ScanResult) -> String {
         var lines = ["CLAIR — Rapport d’analyse", "Application : \(result.app.name)", "Identifiant : \(result.app.bundleID)",
                      "Chemin : \(result.app.url.path)", "Date : \(result.date.formatted())", "", "Ce rapport ne constitue pas une preuve de suppression.", ""]
+        lines += ["Identifiants de composants : " + result.app.componentIDs.sorted().joined(separator: ", "),
+                  "Noms issus du paquet : " + result.app.discoveredNames.sorted().joined(separator: ", "), ""]
         for c in result.candidates {
             lines.append("[\(c.evidence.rawValue)] \(c.url.path) — \(c.bytes) octets\(c.sizeIncomplete ? " (taille partielle)" : "")\n  \(c.reason)")
         }

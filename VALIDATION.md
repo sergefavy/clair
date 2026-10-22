@@ -23,3 +23,8 @@ Les protections réduisent les erreurs de ciblage ; elles ne garantissent ni la 
 - Interface de préparation lancée : sélection en un clic et journal contrôlés. L’arrêt d’une analyse a rendu les boutons actifs et affiché « Analyse annulée. Aucun résultat utilisable ; aucune suppression effectuée. ».
 - L’analyse interactive complète n’a pas été validée : les lectures réelles étaient longues et ont été interrompues. L’interface restait réactive. Les performances, la confirmation modifiée de bout en bout, le journal après une vraie opération et la Corbeille réelle restent à vérifier avant une release stable.
 - Aucune application utilisateur ni aucun résidu réel supprimé. Voir docs/AMELIORATIONS.md pour le travail restant.
+
+
+## Rectification : moteur générique
+
+Les règles spécifiques à Webex/OBS et l’exception Final Cut ont été retirées du moteur. Compilation release réussie et 17 contrôles passés après rectification : identité extraite des métadonnées d’une application fictive, extension embarquée, attribution d’un agent par son exécutable, rejet d’un simple argument mentionnant l’application, exclusion des composants symboliquement liés, conservation de l’identité pour l’analyse après suppression fictive. Les autres protections restent couvertes. Aucun test destructif sur les applications utilisateur ; aucune nouvelle validation de désinstallation réelle revendiquée.

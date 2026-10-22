@@ -25,7 +25,7 @@ L’analyse est ciblée : au plus trois niveaux dans les catégories qui permett
 
 ## Protections
 
-Applications Apple et Clair protégées, avec une exception explicite pour Final Cut Pro (`com.apple.FinalCut`) dans une racine Applications autorisée. Les chemins système restent interdits. Racines de dossiers et groupes partagés interdits. Vérification du chemin résolu, du périmètre autorisé, de l’identité et de la date de modification de chaque élément avant traitement. Ces vérifications ne constituent pas une garantie contre une modification concurrente malveillante du système de fichiers ; fermer les applications concernées avant toute opération.
+Clair et les chemins système sont protégés. Le périmètre autorisé dépend du chemin, pas d’une exception propre à un produit ou un éditeur. Les protections macOS restent applicables. Racines de dossiers et groupes partagés interdits. Vérification du chemin résolu, du périmètre autorisé, de l’identité et de la date de modification de chaque élément avant traitement. Ces vérifications ne constituent pas une garantie contre une modification concurrente malveillante du système de fichiers ; fermer les applications concernées avant toute opération.
 
 ## Compilation et tests
 
@@ -45,10 +45,10 @@ La version fournie est compilée pour Apple Silicon et signée localement (ad ho
 
 La confirmation capture une sélection fixe. Après chaque opération, Clair vérifie l’absence des chemins traités puis relance l’analyse ; les éléments restants restent visibles et décochés. Le résultat ne certifie pas l’absence de résidus hors périmètre ni l’arrêt des services.
 
-Les noms historiques connus de Webex et `obs-studio` sont des indices à vérifier, jamais des éléments présélectionnés. Le mot « Cisco » seul ne suffit pas. Les groupes restent protégés même lorsqu’ils sont identifiés.
+Les noms internes, exécutables et identifiants des composants sont extraits des Info.plist du paquet sélectionné. Ces indices supplémentaires restent à vérifier et ne sont pas présélectionnés. Un agent de démarrage peut être associé par son Program ou le premier ProgramArguments si cet exécutable se trouve dans le paquet. Une simple mention de l’application dans un argument ne suffit pas. Les groupes restent protégés même lorsqu’ils sont identifiés.
 
 Le journal est conservé localement dans `~/Library/Application Support/fr.local.clair/operations.txt`. Il contient des chemins personnels : vérifier son contenu avant de le partager. Les destinations Corbeille sont consignées pour retrouver les éléments dans le Finder ; la restauration automatique n’est pas implémentée.
 
-La recherche par nom d’une application déjà supprimée, l’attribution par signature/reçus, le contrôle d’état des extensions et les désinstalleurs spécifiques restent à développer. Aucune commande globale de réinitialisation des extensions n’est exécutée.
+La recherche par nom d’une application déjà supprimée, la vérification cryptographique et l’attribution par reçus, le contrôle d’état des extensions et les désinstalleurs spécifiques restent à développer. Aucune commande globale de réinitialisation des extensions n’est exécutée.
 
 Le bouton Arrêter rend la main et invalide le résultat de l’analyse annulée. Une lecture système déjà engagée peut terminer ultérieurement ; son résultat est ignoré.

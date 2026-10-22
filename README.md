@@ -23,6 +23,7 @@
 ## Fonctionnalités
 
 - **Analyse locale** des préférences, caches, journaux, conteneurs, données WebKit et autres emplacements usuels.
+- **Identification générique** : noms internes, exécutable, identifiants de composants embarqués et liens des agents de démarrage vers le paquet sélectionné, sans catalogue de marques.
 - **Sélection prudente** : les correspondances incertaines restent décochées ; les groupes partagés et composants système sont protégés.
 - **Confirmation explicite** : liste des chemins avant toute action ; saisie du nom pour une suppression définitive.
 - **Corbeille par défaut**, jamais vidée automatiquement.
@@ -63,7 +64,7 @@ zsh scripts/make-release.sh
 
 - `Sources/Core` : détection, validation des chemins et traitement des fichiers.
 - `Sources/App` : interface et confirmation utilisateur.
-- `Tests` : 15 contrôles sur des fichiers fictifs créés dans le dossier de travail.
+- `Tests` : 17 contrôles sur des fichiers fictifs créés dans le dossier de travail.
 - `scripts` : compilation et création du DMG, du ZIP et des sommes SHA-256.
 
 Les tests ne désinstallent aucun logiciel existant. La publication automatique d’une release se fait en poussant un tag `vX.Y.Z` correspondant à la version d’`Info.plist` : le workflow vérifie le code, compile l’application et joint les fichiers de distribution.

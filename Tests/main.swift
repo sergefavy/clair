@@ -68,7 +68,7 @@ import ClairCore
         XCTAssertThrowsError(try cleaner.validate(candidate, app: app))
     }
     func testAppleApplicationProtected() throws {
-        let apple = InstalledApp(url: app.url, name: "Example", bundleID: "com.apple.example")
+        let apple = InstalledApp(url: URL(fileURLWithPath: "/System/Applications/Example.app"), name: "Example", bundleID: "com.apple.example")
         XCTAssertThrowsError(try cleaner.validatePath(app.url, app: apple))
         XCTAssertTrue(cleaner.scan(apple).candidates.allSatisfy { !$0.removable })
     }
@@ -95,21 +95,54 @@ import ClairCore
         XCTAssertTrue(FileManager.default.fileExists(atPath: a.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: b.path))
     }
-    func testProductAliasesRemainUnselected() throws {
-        let webex = InstalledApp(url: app.url, name: "Webex", bundleID: "com.cisco.webex")
-        let alias = try file("Library/Application Support/Cisco Spark")
-        let unrelated = try file("Library/Application Support/Cisco")
-        let scan = cleaner.scan(webex)
-        XCTAssertTrue(scan.candidates.contains { $0.url == alias && !$0.recommended && $0.removable })
-        XCTAssertFalse(scan.candidates.contains { $0.url == unrelated })
-        let obs = InstalledApp(url: app.url, name: "OBS", bundleID: "com.obsproject.obs-studio")
-        XCTAssertEqual(cleaner.evidence(for: "obs-studio", app: obs), .possible)
-        XCTAssertNil(cleaner.evidence(for: "ch.protonvpn.mac.WireGuard-Extension", app: obs))
+    func plist(_ relative: String, _ values: [String: Any]) throws {
+        let url = try file(relative)
+        try PropertyListSerialization.data(fromPropertyList: values, format: .xml, options: 0).write(to: url)
     }
-    func testFinalCutAndSystemBoundary() throws {
-        let fcp = InstalledApp(url: app.url, name: "Final Cut Pro", bundleID: "com.apple.FinalCut")
+    func testProductAliasesRemainUnselected() throws {
+        try plist("Applications/Example.app/Contents/Info.plist", ["CFBundleIdentifier": app.bundleID, "CFBundleExecutable": "LegacyEngine", "CFBundleName": "InternalProduct"])
+        try plist("Applications/Example.app/Contents/Library/SystemExtensions/Camera.systemextension/Contents/Info.plist", ["CFBundleIdentifier": "net.vendor.camera", "CFBundleName": "CameraEngine"])
+        let alias = try file("Library/Application Support/LegacyEngine")
+        let component = try file("Library/Caches/net.vendor.camera")
+        let unrelated = try file("Library/Application Support/Vendor")
+        let scan = cleaner.scan(app)
+        XCTAssertTrue(scan.candidates.contains { $0.url == alias && !$0.recommended && $0.removable })
+        XCTAssertTrue(scan.candidates.contains { $0.url == component && !$0.recommended })
+        XCTAssertFalse(scan.candidates.contains { $0.url == unrelated })
+        XCTAssertNil(cleaner.evidence(for: "ch.protonvpn.mac.WireGuard-Extension", app: scan.app))
+        XCTAssertTrue(scan.app.componentIDs.contains("net.vendor.camera"))
+        let selected = scan.candidates.filter { $0.url == alias }
+        let outcome = cleaner.execute(selected, app: scan.app, permanent: true)
+        XCTAssertEqual(outcome.0, Set([alias.path]))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.path))
+        // After the app is gone the original identity remains usable for the verification.
+        try FileManager.default.removeItem(at: app.url)
+        XCTAssertTrue(cleaner.scan(scan.app).candidates.contains { $0.url == component })
+    }
+    func testLaunchServiceUsesExecutableOnly() throws {
+        try plist("Applications/Example.app/Contents/Info.plist", ["CFBundleIdentifier": app.bundleID])
+        _ = try file("Applications/Example.app/Contents/MacOS/engine")
+        let path = app.url.appendingPathComponent("Contents/MacOS/engine").path
+        try plist("Library/LaunchAgents/unrelated-name.plist", ["ProgramArguments": [path, "--start"]])
+        try plist("Library/LaunchAgents/unrelated-document.plist", ["ProgramArguments": ["/usr/bin/open", path]])
+        let scan = cleaner.scan(app)
+        XCTAssertTrue(scan.candidates.contains { $0.url.lastPathComponent == "unrelated-name.plist" && !$0.recommended && $0.removable })
+        XCTAssertFalse(scan.candidates.contains { $0.url.lastPathComponent == "unrelated-document.plist" })
+    }
+    func testIdentityDoesNotFollowSymlinks() throws {
+        let outside = root.appendingPathComponent("outside")
+        try plist("outside/Contents/Info.plist", ["CFBundleName": "ExternalEngine", "CFBundleIdentifier": "org.external.helper"])
+        let plugins = app.url.appendingPathComponent("Contents/PlugIns")
+        try FileManager.default.createDirectory(at: plugins, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: plugins.appendingPathComponent("Other.app"), withDestinationURL: outside)
+        let identity = cleaner.discoverIdentity(app)
+        XCTAssertFalse(identity.componentIDs.contains("org.external.helper"))
+        XCTAssertFalse(identity.discoveredNames.contains("ExternalEngine"))
+    }
+    func testApplicationAndSystemBoundary() throws {
+        let fcp = InstalledApp(url: app.url, name: "Example", bundleID: "com.apple.example")
         try cleaner.validatePath(fcp.url, app: fcp)
-        let system = InstalledApp(url: URL(fileURLWithPath: "/System/Applications/Final Cut Pro.app"), name: fcp.name, bundleID: fcp.bundleID)
+        let system = InstalledApp(url: URL(fileURLWithPath: "/System/Applications/Example.app"), name: fcp.name, bundleID: fcp.bundleID)
         XCTAssertThrowsError(try cleaner.validatePath(system.url, app: system))
     }
     func testPostScanShowsRetainedItems() throws {
@@ -140,8 +173,10 @@ var failures = 0
 @MainActor func XCTAssertNil<T>(_ value: T?, file: String = #file, line: Int = #line) { XCTAssertTrue(value == nil, file: file, line: line) }
 @MainActor func XCTAssertThrowsError<T>(_ work: @autoclosure () throws -> T, file: String = #file, line: Int = #line) { do { _ = try work(); XCTAssertTrue(false, file: file, line: line) } catch {} }
 let checks: [(String, @MainActor (CleanerTests) throws -> Void)] = [
-    ("product aliases and unrelated VPN", { try $0.testProductAliasesRemainUnselected() }),
-    ("Final Cut permission and system boundary", { try $0.testFinalCutAndSystemBoundary() }),
+    ("generic bundle identity and post-removal snapshot", { try $0.testProductAliasesRemainUnselected() }),
+    ("launch service executable attribution", { try $0.testLaunchServiceUsesExecutableOnly() }),
+    ("identity excludes symlinked components", { try $0.testIdentityDoesNotFollowSymlinks() }),
+    ("application roots and system boundary", { try $0.testApplicationAndSystemBoundary() }),
     ("post scan retains unselected data", { try $0.testPostScanShowsRetainedItems() }),
     ("identifier boundaries", { $0.testIdentifierBoundary() }),
     ("UUID preferences", { $0.testUUIDPreferences() }),
