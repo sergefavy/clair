@@ -26,7 +26,7 @@
 - **Sélection prudente** : les correspondances incertaines restent décochées ; les groupes partagés et composants système sont protégés.
 - **Confirmation explicite** : liste des chemins avant toute action ; saisie du nom pour une suppression définitive.
 - **Corbeille par défaut**, jamais vidée automatiquement.
-- **Rapport exportable** et journal des réussites et échecs de la session.
+- **Rapport exportable** et journal local persistant des réussites, échecs et destinations dans la Corbeille.
 - **Analyse partielle signalée** si des dossiers ne peuvent pas être lus.
 - Interface française, sans compte et sans requête réseau de l’application.
 
@@ -63,7 +63,7 @@ zsh scripts/make-release.sh
 
 - `Sources/Core` : détection, validation des chemins et traitement des fichiers.
 - `Sources/App` : interface et confirmation utilisateur.
-- `Tests` : 12 contrôles sur des fichiers fictifs créés dans le dossier de travail.
+- `Tests` : 15 contrôles sur des fichiers fictifs créés dans le dossier de travail.
 - `scripts` : compilation et création du DMG, du ZIP et des sommes SHA-256.
 
 Les tests ne désinstallent aucun logiciel existant. La publication automatique d’une release se fait en poussant un tag `vX.Y.Z` correspondant à la version d’`Info.plist` : le workflow vérifie le code, compile l’application et joint les fichiers de distribution.

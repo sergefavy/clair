@@ -95,6 +95,33 @@ import ClairCore
         XCTAssertTrue(FileManager.default.fileExists(atPath: a.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: b.path))
     }
+    func testProductAliasesRemainUnselected() throws {
+        let webex = InstalledApp(url: app.url, name: "Webex", bundleID: "com.cisco.webex")
+        let alias = try file("Library/Application Support/Cisco Spark")
+        let unrelated = try file("Library/Application Support/Cisco")
+        let scan = cleaner.scan(webex)
+        XCTAssertTrue(scan.candidates.contains { $0.url == alias && !$0.recommended && $0.removable })
+        XCTAssertFalse(scan.candidates.contains { $0.url == unrelated })
+        let obs = InstalledApp(url: app.url, name: "OBS", bundleID: "com.obsproject.obs-studio")
+        XCTAssertEqual(cleaner.evidence(for: "obs-studio", app: obs), .possible)
+        XCTAssertNil(cleaner.evidence(for: "ch.protonvpn.mac.WireGuard-Extension", app: obs))
+    }
+    func testFinalCutAndSystemBoundary() throws {
+        let fcp = InstalledApp(url: app.url, name: "Final Cut Pro", bundleID: "com.apple.FinalCut")
+        try cleaner.validatePath(fcp.url, app: fcp)
+        let system = InstalledApp(url: URL(fileURLWithPath: "/System/Applications/Final Cut Pro.app"), name: fcp.name, bundleID: fcp.bundleID)
+        XCTAssertThrowsError(try cleaner.validatePath(system.url, app: system))
+    }
+    func testPostScanShowsRetainedItems() throws {
+        let exact = try file("Library/Caches/org.example.product")
+        let retained = try file("Library/Application Support/Example")
+        let chosen = cleaner.scan(app).candidates.filter { $0.url == exact }
+        let outcome = cleaner.execute(chosen, app: app, permanent: true)
+        let after = cleaner.scan(app)
+        XCTAssertEqual(outcome.0, Set([exact.path]))
+        XCTAssertFalse(after.candidates.contains { $0.url == exact })
+        XCTAssertTrue(after.candidates.contains { $0.url == retained })
+    }
     func testSizeDoesNotFollowExternalSymlinks() throws {
         let folder = root.appendingPathComponent("measure")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -113,6 +140,9 @@ var failures = 0
 @MainActor func XCTAssertNil<T>(_ value: T?, file: String = #file, line: Int = #line) { XCTAssertTrue(value == nil, file: file, line: line) }
 @MainActor func XCTAssertThrowsError<T>(_ work: @autoclosure () throws -> T, file: String = #file, line: Int = #line) { do { _ = try work(); XCTAssertTrue(false, file: file, line: line) } catch {} }
 let checks: [(String, @MainActor (CleanerTests) throws -> Void)] = [
+    ("product aliases and unrelated VPN", { try $0.testProductAliasesRemainUnselected() }),
+    ("Final Cut permission and system boundary", { try $0.testFinalCutAndSystemBoundary() }),
+    ("post scan retains unselected data", { try $0.testPostScanShowsRetainedItems() }),
     ("identifier boundaries", { $0.testIdentifierBoundary() }),
     ("UUID preferences", { $0.testUUIDPreferences() }),
     ("protected roots and documents", { try $0.testProtectedRootsAndDocuments() }),

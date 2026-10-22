@@ -8,7 +8,7 @@ public struct InstalledApp: Identifiable, Sendable, Hashable {
     public init(url: URL, name: String, bundleID: String) {
         self.url = url.standardizedFileURL; self.name = name; self.bundleID = bundleID
     }
-    public var protected: Bool { bundleID.hasPrefix("com.apple.") || bundleID == "fr.local.clair" }
+    public var protected: Bool { (bundleID.hasPrefix("com.apple.") && bundleID != "com.apple.FinalCut") || bundleID == "fr.local.clair" }
 }
 
 public enum Evidence: String, Sendable {
@@ -111,6 +111,17 @@ public struct Cleaner: Sendable {
          ("Autosave Information", "Sauvegardes automatiques")]
     }
 
+    // Historical product names are clues, never automatic deletion authority.
+    private func aliases(_ app: InstalledApp) -> [String] {
+        switch app.bundleID.lowercased() {
+        case "com.obsproject.obs-studio": return ["obs-studio"]
+        case "com.cisco.webex", "com.cisco.webexmeetingsapp", "com.cisco.webex.cisco-webex-start", "com.cisco.spark":
+            return ["Webex", "Cisco Spark", "Webex Meetings", "Cisco Webex Launcher", "WebEx Folder",
+                    "com.cisco.webex.Cisco-WebEx-Start", "com.cisco.webex.Cisco-WebEx-Start.CWSSafariExtension", "group.com.cisco.webex.meetings"]
+        default: return []
+        }
+    }
+
     // Only exact identifiers, known suffixes, or UUID-suffixed preference files are high confidence.
     public func evidence(for filename: String, app: InstalledApp) -> Evidence? {
         let f = filename.lowercased(), bid = app.bundleID.lowercased()
@@ -123,7 +134,7 @@ public struct Cleaner: Sendable {
             if f.hasPrefix(bid + ".") || f.hasPrefix(bid + "-") { return .possible }
         }
         let stem = URL(fileURLWithPath: filename).deletingPathExtension().lastPathComponent
-        let names = [app.name, app.url.deletingPathExtension().lastPathComponent].map(Self.normalized).filter { $0.count >= 4 }
+        let names = ([app.name, app.url.deletingPathExtension().lastPathComponent] + aliases(app)).map(Self.normalized).filter { $0.count >= 4 }
         if names.contains(Self.normalized(filename)) || names.contains(Self.normalized(stem)) { return .possible }
         return nil
     }
@@ -136,6 +147,7 @@ public struct Cleaner: Sendable {
         var bytes: Int64 = 0, count = 0, incomplete = false
         guard let walk = fm.enumerator(at: url, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey], errorHandler: { _, _ in incomplete = true; return true }) else { return (0, true) }
         for case let item as URL in walk {
+            if Task.isCancelled { incomplete = true; break }
             count += 1
             if count > 150_000 { incomplete = true; break }
             guard let value = try? item.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]) else { incomplete = true; continue }
@@ -157,6 +169,7 @@ public struct Cleaner: Sendable {
         }
         add(app.url, "Application", .application, "Paquet de l’application sélectionnée.")
         for (relative, category) in locations {
+            if Task.isCancelled { break }
             let root = home.appendingPathComponent("Library/" + relative)
             guard fm.fileExists(atPath: root.path) else { continue }
             do {
@@ -164,6 +177,7 @@ public struct Cleaner: Sendable {
                 var visited = 0
                 func examine(_ entries: [URL], depth: Int) {
                     for url in entries {
+                        if Task.isCancelled { return }
                         visited += 1
                         if visited > 25_000 { return }
                         let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
@@ -188,18 +202,30 @@ public struct Cleaner: Sendable {
                 if visited > 25_000 { warnings.append("Analyse limitée à 25 000 entrées dans \(root.path).") }
             } catch { warnings.append("Accès refusé ou lecture impossible : \(root.path)") }
         }
-        for relative in ["Application Support", "Caches", "Preferences", "LaunchAgents", "LaunchDaemons", "PrivilegedHelperTools"] {
+        for relative in ["Application Support", "Caches", "Preferences", "LaunchAgents", "LaunchDaemons", "PrivilegedHelperTools", "CoreMediaIO/Plug-Ins/DAL", "Audio/Plug-Ins", "SystemExtensions"] {
+            if Task.isCancelled { break }
             let root = URL(fileURLWithPath: "/Library/" + relative)
             guard fm.fileExists(atPath: root.path) else { continue }
             do {
-                for url in try fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) {
+                var queue = try fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil).map { ($0, 0) }
+                var visited = 0
+                while let (url, depth) = queue.popLast() {
+                    if Task.isCancelled { break }
+                    visited += 1
+                    if visited > 25_000 { warnings.append("Analyse limitée à 25 000 entrées dans \(root.path)."); break }
+                    let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                    if values.isSymbolicLink == true { continue }
                     if evidence(for: url.lastPathComponent, app: app) != nil {
-                        add(url, "Système", .system, "Composant global : utilise le désinstalleur de l’éditeur. Aucun accès administrateur demandé.")
+                        add(url, "Système", .system, "Composant global : utilise le désinstalleur de l’éditeur. Aucun accès administrateur demandé. Son état d’activation n’est pas vérifié.")
+                    } else if depth < 2 && values.isDirectory == true {
+                        do { queue += try fm.contentsOfDirectory(at: url, includingPropertiesForKeys: nil).map { ($0, depth + 1) } }
+                        catch { warnings.append("Sous-dossier système inaccessible : \(url.path)") }
                     }
                 }
             } catch { warnings.append("Dossier système inaccessible : \(root.path)") }
         }
         warnings.append("Analyse ciblée des dossiers usuels, jusqu’à 3 niveaux. Les groupes partagés, composants système, reçus d’installation, trousseaux, documents et données cloud ne sont pas supprimés. Les fichiers portant un autre nom peuvent ne pas être détectés.")
+        if Task.isCancelled { warnings.append("Analyse limitée : interrompue à la demande de l’utilisateur.") }
         if app.bundleID.isEmpty { warnings.append("Identifiant absent : seules des correspondances de nom sont disponibles.") }
         if app.protected { warnings.append("Cette application est protégée contre la suppression.") }
         return ScanResult(app: app, candidates: candidates.sorted { $0.url.path < $1.url.path }, warnings: Array(Set(warnings)).sorted(), date: Date())
@@ -242,7 +268,17 @@ public struct Cleaner: Sendable {
                 do {
                     try validate(candidate, app: app)
                     if permanent { try FileManager.default.removeItem(at: candidate.url) }
-                    else { var destination: NSURL?; try FileManager.default.trashItem(at: candidate.url, resultingItemURL: &destination) }
+                    else {
+                        var destination: NSURL?
+                        try FileManager.default.trashItem(at: candidate.url, resultingItemURL: &destination)
+                        guard let destination, FileManager.default.fileExists(atPath: destination.path ?? "") else {
+                            throw CleanerError.unsafe("Destination Corbeille non vérifiée pour " + candidate.url.path)
+                        }
+                        lines.append("DESTINATION CORBEILLE : \(destination.path ?? "")")
+                    }
+                    guard !FileManager.default.fileExists(atPath: candidate.url.path) else {
+                        throw CleanerError.changed(candidate.url.path)
+                    }
                     removed.insert(candidate.id)
                     lines.append("\(permanent ? "SUPPRIMÉ" : "CORBEILLE") : \(candidate.url.path)")
                 } catch { failed = true; lines.append("ÉCHEC : \(candidate.url.path) — \(error.localizedDescription)") }

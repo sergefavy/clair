@@ -8,22 +8,38 @@ private typealias ViewState<Value> = SwiftUI.State<Value>
 private let accent = Color(red: 0.21, green: 0.70, blue: 0.56)
 private func size(_ bytes: Int64) -> String { ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file) }
 
+struct RemovalSelection: Identifiable {
+    let id = UUID()
+    let app: InstalledApp
+    let candidates: [Candidate]
+    var bytes: Int64 { candidates.reduce(0) { $0 + $1.bytes } }
+}
+
 @MainActor final class Model: ObservableObject {
     @Published var apps: [InstalledApp] = []
     @Published var selected: InstalledApp?
     @Published var result: ScanResult?
     @Published var checked = Set<String>()
     @Published var busy = false
+    @Published var scanning = false
+    private var scanGeneration = UUID()
+    private var scanTask: Task<ScanResult, Never>?
     @Published var status = "Choisis une application pour examiner ses fichiers."
     @Published var search = ""
     @Published var problem: String?
     @Published var journal = ""
     let cleaner = Cleaner()
+    private var journalURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/fr.local.clair/operations.txt")
+    }
+    init() { journal = (try? String(contentsOf: journalURL, encoding: .utf8)) ?? "" }
+
     var chosen: [Candidate] { result?.candidates.filter { checked.contains($0.id) && $0.removable } ?? [] }
     var bytes: Int64 { chosen.reduce(0) { $0 + $1.bytes } }
     var filtered: [InstalledApp] { apps.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.bundleID.localizedCaseInsensitiveContains(search) } }
 
     func load() async {
+        guard !busy else { return }
         busy = true; status = "Recherche des applications…"
         let cleaner = cleaner
         apps = await Task.detached(priority: .userInitiated) { cleaner.applications() }.value
@@ -38,11 +54,22 @@ private func size(_ bytes: Int64) -> String { ByteCountFormatter.string(fromByte
         guard let app = selected, !busy else { return }
         busy = true; result = nil; checked = []; status = "Analyse de \(app.name)…"
         let cleaner = cleaner
-        let scan = await Task.detached(priority: .userInitiated) { cleaner.scan(app) }.value
-        result = scan; checked = Set(scan.candidates.filter(\.recommended).map(\.id))
+        scanning = true
+        let generation = UUID(); scanGeneration = generation
+        let task = Task.detached(priority: .userInitiated) { cleaner.scan(app) }
+        scanTask = task
+        let scan = await task.value
+        guard scanGeneration == generation else { return }
+        scanTask = nil; scanning = false
+        result = scan; checked = task.isCancelled ? [] : Set(scan.candidates.filter(\.recommended).map(\.id))
         busy = false
         let partial = scan.warnings.contains { $0.contains("inaccessible") || $0.contains("Accès refusé") || $0.contains("Analyse limitée") }
         status = "\(partial ? "Analyse partielle" : "Analyse terminée") · \(scan.candidates.count) éléments repérés."
+    }
+    func cancelScan() {
+        scanTask?.cancel(); scanTask = nil; scanGeneration = UUID()
+        scanning = false; busy = false; result = nil; checked = []
+        status = "Analyse annulée. Aucun résultat utilisable ; aucune suppression effectuée."
     }
     func running(_ app: InstalledApp) -> Bool {
         NSWorkspace.shared.runningApplications.contains {
@@ -50,24 +77,30 @@ private func size(_ bytes: Int64) -> String { ByteCountFormatter.string(fromByte
             ($0.executableURL.map { Cleaner.isWithin($0, app.url) } ?? false)
         }
     }
-    func remove(permanent: Bool) async {
-        guard let result, !busy, !chosen.isEmpty else { return }
-        guard !running(result.app) else {
-            problem = "Quitte \(result.app.name) avant de continuer, puis relance l’analyse. Clair ne ferme pas tes applications de force."; return
+    func remove(_ selection: RemovalSelection, permanent: Bool) async {
+        guard !busy, !selection.candidates.isEmpty else { return }
+        guard !running(selection.app) else {
+            problem = "Quitte \(selection.app.name) avant de continuer, puis relance l’analyse. Clair ne ferme pas tes applications de force."; return
         }
-        let candidates = chosen, cleaner = cleaner, app = result.app
+        let candidates = selection.candidates, cleaner = cleaner, app = selection.app
         busy = true; status = permanent ? "Suppression des éléments confirmés…" : "Déplacement vers la Corbeille…"
         let outcome = await Task.detached(priority: .userInitiated) { () -> (Set<String>, String) in
             cleaner.execute(candidates, app: app, permanent: permanent)
         }.value
-        journal += outcome.1 + "\n"
-        checked.subtract(outcome.0)
-        self.result = nil; checked = []
-        if outcome.0.contains(app.url.path) { apps.removeAll { $0.id == app.id }; selected = nil }
+        status = "Vérification après l’opération…"
+        let verification = await Task.detached(priority: .userInitiated) { cleaner.scan(app) }.value
+        journal += outcome.1 + "\n\nVÉRIFICATION APRÈS OPÉRATION\n" + cleaner.report(verification) + "\n"
+        do {
+            try FileManager.default.createDirectory(at: journalURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try journal.write(to: journalURL, atomically: true, encoding: .utf8)
+        } catch { journal += "\nÉCHEC DE SAUVEGARDE DU JOURNAL : \(error.localizedDescription)\n" }
+        self.result = verification; checked = []; selected = app
+        if outcome.0.contains(app.url.path) { apps.removeAll { $0.id == app.id } }
         busy = false
-        status = "\(outcome.0.count)/\(candidates.count) éléments traités. Consulte le journal pour le détail."
-        problem = status + "\n\nLes agents de démarrage déjà actifs peuvent nécessiter une fermeture de session. Une nouvelle analyse est nécessaire avant une autre opération."
+        status = "\(outcome.0.count)/\(candidates.count) éléments vérifiés comme traités · \(verification.candidates.count) éléments encore repérés."
+        problem = status + "\n\nLe rapport affiche les éléments conservés et les limites d’accès. Les services et extensions peuvent rester actifs : leur état n’est pas vérifié par Clair."
     }
+
     func export(_ text: String, filename: String) {
         let panel = NSSavePanel(); panel.nameFieldStringValue = filename; panel.allowedContentTypes = [.plainText]
         guard panel.runModal() == .OK, let url = panel.url else { return }
@@ -87,7 +120,7 @@ private func size(_ bytes: Int64) -> String { ByteCountFormatter.string(fromByte
 
 struct MainView: View {
     @ObservedObject var model: Model
-    @ViewState<Bool> private var confirmation = false
+    @ViewState<RemovalSelection?> private var confirmation = nil
     @ViewState<Bool> private var showJournal = false
     var body: some View {
         NavigationSplitView {
@@ -110,7 +143,7 @@ struct MainView: View {
                                     }
                                     Spacer(minLength: 0)
                                     if app.protected { Image(systemName: "lock.fill").font(.caption2).foregroundStyle(.secondary) }
-                                }.padding(9).background(model.selected == app ? accent.opacity(0.17) : Color.clear).clipShape(RoundedRectangle(cornerRadius: 9))
+                                }.padding(9).contentShape(Rectangle()).background(model.selected == app ? accent.opacity(0.17) : Color.clear).clipShape(RoundedRectangle(cornerRadius: 9))
                             }.buttonStyle(.plain).disabled(model.busy)
                         }
                     }
@@ -186,16 +219,17 @@ struct MainView: View {
                 HStack(spacing: 16) {
                     Text(model.status).font(.caption).foregroundStyle(.secondary).lineLimit(2)
                     Spacer()
-                    Button { confirmation = true } label: { Label("Examiner la suppression…", systemImage: "trash").padding(.vertical, 5) }.buttonStyle(.borderedProminent).disabled(model.chosen.isEmpty || model.busy)
+                    if model.scanning { Button("Arrêter l’analyse") { model.cancelScan() } }
+                    Button { if let app = model.result?.app { confirmation = RemovalSelection(app: app, candidates: model.chosen) } } label: { Label("Examiner la suppression…", systemImage: "trash").padding(.vertical, 5) }.buttonStyle(.borderedProminent).disabled(model.chosen.isEmpty || model.busy)
                 }.padding(20)
             }.background(Color(red: 0.065, green: 0.085, blue: 0.09))
         }
         .task { await model.load() }
-        .sheet(isPresented: $confirmation) { ConfirmationView(model: model) }
+        .sheet(item: $confirmation) { selection in ConfirmationView(model: model, selection: selection) }
         .sheet(isPresented: $showJournal) {
             VStack(alignment: .leading, spacing: 18) {
                 Text("Journal des opérations").font(.title2.bold())
-                Text("Résultats de cette session. Exporte le journal pour le conserver.").foregroundStyle(.secondary)
+                Text("Historique local des opérations. Les chemins de la Corbeille sont conservés dans ce journal.").foregroundStyle(.secondary)
                 ScrollView { Text(model.journal.isEmpty ? "Aucune suppression effectuée." : model.journal).font(.system(.caption, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
                 HStack { Button("Exporter") { model.export(model.journal, filename: "Clair-journal.txt") }.disabled(model.journal.isEmpty); Spacer(); Button("Fermer") { showJournal = false }.keyboardShortcut(.cancelAction) }
             }.padding(26).frame(width: 740, height: 480)
@@ -219,35 +253,40 @@ struct CandidateRow: View {
         HStack(alignment: .top, spacing: 12) {
             Toggle("Sélectionner \(candidate.url.lastPathComponent)", isOn: Binding(get: { checked.contains(candidate.id) }, set: { if $0 { checked.insert(candidate.id) } else { checked.remove(candidate.id) } })).labelsHidden().toggleStyle(.checkbox).disabled(!candidate.removable).padding(.top, 4)
             VStack(alignment: .leading, spacing: 5) {
-                HStack { Text(candidate.url.lastPathComponent).font(.system(size: 12, weight: .semibold)).lineLimit(1); Spacer(); Text((candidate.sizeIncomplete ? "≥ " : "") + size(candidate.bytes)).font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
+                HStack { Button {
+                    if checked.contains(candidate.id) { checked.remove(candidate.id) } else { checked.insert(candidate.id) }
+                } label: {
+                    Text(candidate.url.lastPathComponent).font(.system(size: 12, weight: .semibold)).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+                }.buttonStyle(.plain).disabled(!candidate.removable); Spacer(); Text((candidate.sizeIncomplete ? "≥ " : "") + size(candidate.bytes)).font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
                 Text(candidate.url.path).font(.system(size: 10)).foregroundStyle(.secondary).textSelection(.enabled)
                 HStack(spacing: 8) { Text(candidate.category); Text("·"); Text(candidate.evidence.rawValue).foregroundStyle(candidate.removable ? (candidate.evidence == .possible ? Color.orange : accent) : Color.orange) }.font(.system(size: 10))
                 Text(candidate.reason).font(.system(size: 10)).foregroundStyle(.secondary)
             }
-            Button { NSWorkspace.shared.activateFileViewerSelecting([candidate.url]) } label: { Image(systemName: "folder") }.buttonStyle(.borderless).help("Afficher dans le Finder")
+            Button { NSWorkspace.shared.activateFileViewerSelecting([candidate.url]) } label: { Image(systemName: "folder").frame(width: 30, height: 30).contentShape(Rectangle()) }.buttonStyle(.borderless).help("Afficher dans le Finder")
         }.padding(13).background(.white.opacity(0.035)).clipShape(RoundedRectangle(cornerRadius: 9))
     }
 }
 
 struct ConfirmationView: View {
     @ObservedObject var model: Model
+    let selection: RemovalSelection
     @Environment(\.dismiss) private var dismiss
     @ViewState<Bool> private var permanent = false
     @ViewState<String> private var typed = ""
     @ViewState<Bool> private var acknowledged = false
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            Label("Confirmer pour \(model.selected?.name ?? "")", systemImage: "hand.raised.fill").font(.title2.bold())
-            Text("\(model.chosen.count) éléments · \(size(model.bytes)) estimés. Seuls les chemins ci-dessous seront traités.").foregroundStyle(.secondary)
-            ScrollView { VStack(alignment: .leading, spacing: 7) { ForEach(model.chosen) { Text($0.url.path).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) } } }.frame(height: 170).padding(12).background(.black.opacity(0.15)).clipShape(RoundedRectangle(cornerRadius: 10))
+            Label("Confirmer pour \(selection.app.name)", systemImage: "hand.raised.fill").font(.title2.bold())
+            Text("\(selection.candidates.count) éléments · \(size(selection.bytes)) estimés. Seuls les chemins ci-dessous seront traités.").foregroundStyle(.secondary)
+            ScrollView { VStack(alignment: .leading, spacing: 7) { ForEach(selection.candidates) { Text($0.url.path).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) } } }.frame(height: 170).padding(12).background(.black.opacity(0.15)).clipShape(RoundedRectangle(cornerRadius: 10))
             Picker("Méthode", selection: $permanent) { Text("Déplacer dans la Corbeille").tag(false); Text("Supprimer définitivement").tag(true) }.pickerStyle(.segmented)
             Text(permanent ? "Cette action est irréversible. Les données, réglages et sessions sélectionnés seront effacés." : "Les éléments seront déplacés dans la Corbeille. Clair ne vide jamais la Corbeille.").font(.callout).foregroundStyle(permanent ? Color.orange : Color.secondary)
             Toggle("J’ai vérifié la liste et sauvegardé les données à conserver.", isOn: $acknowledged)
             if permanent {
-                Text("Saisis exactement « \(model.selected?.name ?? "") » pour autoriser la suppression définitive.").font(.caption)
+                Text("Saisis exactement « \(selection.app.name) » pour autoriser la suppression définitive.").font(.caption)
                 TextField("Nom de l’application", text: $typed).textFieldStyle(.roundedBorder)
             }
-            HStack { Button("Annuler") { dismiss() }.keyboardShortcut(.cancelAction); Spacer(); Button(permanent ? "Supprimer définitivement" : "Déplacer dans la Corbeille", role: .destructive) { let mode = permanent; dismiss(); Task { await model.remove(permanent: mode) } }.disabled(!acknowledged || (permanent && typed != model.selected?.name)).buttonStyle(.borderedProminent).tint(permanent ? .red : accent) }
+            HStack { Button("Annuler") { dismiss() }.keyboardShortcut(.cancelAction); Spacer(); Button(permanent ? "Supprimer définitivement" : "Déplacer dans la Corbeille", role: .destructive) { let mode = permanent; dismiss(); Task { await model.remove(selection, permanent: mode) } }.disabled(!acknowledged || (permanent && typed != selection.app.name)).buttonStyle(.borderedProminent).tint(permanent ? .red : accent) }
         }.padding(28).frame(width: 690)
     }
 }
