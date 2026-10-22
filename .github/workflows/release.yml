@@ -1,0 +1,33 @@
+name: Publier une version
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  release:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Vérifier le numéro de version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' Info.plist)
+          test "$RELEASE_TAG" = "v$version"
+          test -f "release-notes/$RELEASE_TAG.md"
+      - name: Tests
+        run: swift run --build-system native ClairChecks
+      - name: Compiler
+        run: zsh scripts/build.sh
+      - name: Créer le DMG et les empreintes
+        run: zsh scripts/make-release.sh
+      - name: Publier la release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$RELEASE_TAG" build/releases/* --verify-tag --title "Clair ${RELEASE_TAG#v}" --notes-file "release-notes/$RELEASE_TAG.md"
