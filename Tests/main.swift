@@ -1,6 +1,28 @@
 import Foundation
 import ClairCore
 
+actor FixtureRecycler {
+    enum Behavior: Sendable { case move, refuse, cancel, missingDestination, sourceRetained, failData }
+    let root: URL
+    let appURL: URL
+    let behavior: Behavior
+    var calls: [URL] = []
+    init(root: URL, appURL: URL, behavior: Behavior = .move) {
+        self.root = root; self.appURL = appURL; self.behavior = behavior
+    }
+    func recycle(_ url: URL) throws -> URL {
+        calls.append(url)
+        if behavior == .cancel { throw CancellationError() }
+        if behavior == .refuse || (behavior == .failData && url != appURL) { throw CocoaError(.fileWriteNoPermission) }
+        let destination = root.appendingPathComponent("simulated-trash/" + url.lastPathComponent)
+        if behavior == .missingDestination { return destination }
+        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if behavior == .sourceRetained { try FileManager.default.copyItem(at: url, to: destination) }
+        else { try FileManager.default.moveItem(at: url, to: destination) }
+        return destination
+    }
+}
+
 @MainActor final class CleanerTests {
     var root: URL!
     var cleaner: Cleaner!
@@ -75,31 +97,118 @@ import ClairCore
     func testBoundaryCannotMatchSiblingFolder() {
         XCTAssertFalse(Cleaner.isWithin(root.appendingPathComponent("Library/CachesBackup/Example"), root.appendingPathComponent("Library/Caches")))
     }
-    func testPermanentRemovalOfSyntheticFixtureOnly() throws {
+    func testPermanentRemovalOfSyntheticFixtureOnly() async throws {
         let exact = try file("Library/Caches/org.example.product")
         let unrelated = try file("Library/Caches/org.example.unrelated")
         let chosen = cleaner.scan(app).candidates.filter { $0.url.path == exact.path }
-        let outcome = cleaner.execute(chosen, app: app, permanent: true)
-        XCTAssertEqual(outcome.0.count, 1)
+        let outcome = await cleaner.execute(chosen, app: app, permanent: true)
+        XCTAssertEqual(outcome.removed.count, 1)
         XCTAssertFalse(FileManager.default.fileExists(atPath: exact.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: app.url.path))
     }
-    func testPreflightFailurePreservesAllFiles() throws {
+    func testPreflightFailurePreservesAllFiles() async throws {
         let a = try file("Library/Caches/org.example.product")
         let b = try file("Library/Preferences/org.example.product.plist")
         let chosen = cleaner.scan(app).candidates.filter { $0.url.path == a.path || $0.url.path == b.path }
         try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1)], ofItemAtPath: b.path)
-        let outcome = cleaner.execute(chosen, app: app, permanent: true)
-        XCTAssertTrue(outcome.0.isEmpty)
+        let outcome = await cleaner.execute(chosen, app: app, permanent: true)
+        XCTAssertTrue(outcome.removed.isEmpty)
         XCTAssertTrue(FileManager.default.fileExists(atPath: a.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: b.path))
+    }
+    func testDeniedApplicationPreservesSelection() async throws {
+        let data = try file("Library/Caches/org.example.product")
+        let appURL = app.url
+        let restricted = Cleaner(home: root, applicationRoots: [appURL.deletingLastPathComponent()], canRemove: { $0 != appURL })
+        let chosen = restricted.scan(app).candidates.filter { $0.url == appURL || $0.url == data }
+        let outcome = await restricted.execute(chosen, app: app, permanent: true)
+        XCTAssertTrue(outcome.removed.isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: appURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: data.path))
+    }
+    func testNativeTrashRefusalAndCancellationPreserveData() async throws {
+        let data = try file("Library/Caches/org.example.product")
+        let appURL = app.url
+        let restricted = Cleaner(home: root, applicationRoots: [appURL.deletingLastPathComponent()], canRemove: { $0 != appURL })
+        let chosen = restricted.scan(app).candidates.filter { $0.url == appURL || $0.url == data }
+        for behavior in [FixtureRecycler.Behavior.refuse, .cancel] {
+            let recycler = FixtureRecycler(root: root, appURL: appURL, behavior: behavior)
+            let outcome = await restricted.execute(chosen, app: app, permanent: false, recycle: { try await recycler.recycle($0) })
+            XCTAssertTrue(outcome.removed.isEmpty)
+            XCTAssertTrue(outcome.problem != nil)
+            XCTAssertEqual(await recycler.calls, [appURL])
+            XCTAssertTrue(FileManager.default.fileExists(atPath: data.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: appURL.path))
+        }
+    }
+    func testNativeTrashApplicationBeforeData() async throws {
+        let data = try file("Library/Caches/org.example.product")
+        let appURL = app.url
+        let restricted = Cleaner(home: root, applicationRoots: [appURL.deletingLastPathComponent()], canRemove: { $0 != appURL })
+        let chosen = restricted.scan(app).candidates.filter { $0.url == appURL || $0.url == data }
+        let recycler = FixtureRecycler(root: root, appURL: appURL)
+        let outcome = await restricted.execute(chosen.reversed(), app: app, permanent: false, recycle: { try await recycler.recycle($0) })
+        XCTAssertEqual(await recycler.calls, [appURL, data])
+        XCTAssertEqual(outcome.removed, Set([appURL.path, data.path]))
+        XCTAssertNil(outcome.problem)
+        XCTAssertTrue(outcome.log.contains("DESTINATION CORBEILLE"))
+    }
+    func testDeniedDataPreventsNativeTrash() async throws {
+        let data = try file("Library/Caches/org.example.product")
+        let restricted = Cleaner(home: root, applicationRoots: [app.url.deletingLastPathComponent()], canRemove: { $0 != data })
+        let chosen = restricted.scan(app).candidates.filter { $0.url == app.url || $0.url == data }
+        let recycler = FixtureRecycler(root: root, appURL: app.url)
+        let outcome = await restricted.execute(chosen, app: app, permanent: false, recycle: { try await recycler.recycle($0) })
+        XCTAssertTrue(outcome.removed.isEmpty)
+        XCTAssertEqual(await recycler.calls, [])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: data.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: app.url.path))
+    }
+    func testTrashDestinationAndSourceAreVerified() async throws {
+        let data = try file("Library/Caches/org.example.product")
+        let chosen = cleaner.scan(app).candidates.filter { $0.url == app.url || $0.url == data }
+        for behavior in [FixtureRecycler.Behavior.missingDestination, .sourceRetained] {
+            let recycler = FixtureRecycler(root: root, appURL: app.url, behavior: behavior)
+            let outcome = await cleaner.execute(chosen, app: app, permanent: false, recycle: { try await recycler.recycle($0) })
+            XCTAssertTrue(outcome.removed.isEmpty)
+            XCTAssertTrue(outcome.problem != nil)
+            XCTAssertEqual(await recycler.calls, [app.url])
+            XCTAssertTrue(FileManager.default.fileExists(atPath: data.path))
+        }
+    }
+    func testPartialTrashStopsAndReportsFailure() async throws {
+        let data = try file("Library/Caches/org.example.product")
+        let remaining = try file("Library/Preferences/org.example.product.plist")
+        let chosen = cleaner.scan(app).candidates.filter { $0.url == app.url || $0.url == data || $0.url == remaining }
+        let recycler = FixtureRecycler(root: root, appURL: app.url, behavior: .failData)
+        let outcome = await cleaner.execute(chosen, app: app, permanent: false, recycle: { try await recycler.recycle($0) })
+        XCTAssertEqual(outcome.removed, Set([app.url.path]))
+        XCTAssertTrue(outcome.problem?.contains("1/3") == true)
+        XCTAssertEqual(await recycler.calls, [app.url, data])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: data.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: remaining.path))
+    }
+    func testTrashRevalidatesAfterNativePrompt() async throws {
+        let data = try file("Library/Caches/org.example.product")
+        let appURL = app.url
+        let chosen = cleaner.scan(app).candidates.filter { $0.url == appURL || $0.url == data }
+        let recycler = FixtureRecycler(root: root, appURL: appURL)
+        let outcome = await cleaner.execute(chosen, app: app, permanent: false, recycle: { url in
+            let destination = try await recycler.recycle(url)
+            if url == appURL { try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1)], ofItemAtPath: data.path) }
+            return destination
+        })
+        XCTAssertEqual(outcome.removed, Set([appURL.path]))
+        XCTAssertTrue(outcome.problem?.contains("Fichier modifié") == true)
+        XCTAssertEqual(await recycler.calls, [appURL])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: data.path))
     }
     func plist(_ relative: String, _ values: [String: Any]) throws {
         let url = try file(relative)
         try PropertyListSerialization.data(fromPropertyList: values, format: .xml, options: 0).write(to: url)
     }
-    func testProductAliasesRemainUnselected() throws {
+    func testProductAliasesRemainUnselected() async throws {
         try plist("Applications/Example.app/Contents/Info.plist", ["CFBundleIdentifier": app.bundleID, "CFBundleExecutable": "LegacyEngine", "CFBundleName": "InternalProduct"])
         try plist("Applications/Example.app/Contents/Library/SystemExtensions/Camera.systemextension/Contents/Info.plist", ["CFBundleIdentifier": "net.vendor.camera", "CFBundleName": "CameraEngine"])
         let alias = try file("Library/Application Support/LegacyEngine")
@@ -112,8 +221,8 @@ import ClairCore
         XCTAssertNil(cleaner.evidence(for: "ch.protonvpn.mac.WireGuard-Extension", app: scan.app))
         XCTAssertTrue(scan.app.componentIDs.contains("net.vendor.camera"))
         let selected = scan.candidates.filter { $0.url == alias }
-        let outcome = cleaner.execute(selected, app: scan.app, permanent: true)
-        XCTAssertEqual(outcome.0, Set([alias.path]))
+        let outcome = await cleaner.execute(selected, app: scan.app, permanent: true)
+        XCTAssertEqual(outcome.removed, Set([alias.path]))
         XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.path))
         // After the app is gone the original identity remains usable for the verification.
         try FileManager.default.removeItem(at: app.url)
@@ -145,13 +254,13 @@ import ClairCore
         let system = InstalledApp(url: URL(fileURLWithPath: "/System/Applications/Example.app"), name: fcp.name, bundleID: fcp.bundleID)
         XCTAssertThrowsError(try cleaner.validatePath(system.url, app: system))
     }
-    func testPostScanShowsRetainedItems() throws {
+    func testPostScanShowsRetainedItems() async throws {
         let exact = try file("Library/Caches/org.example.product")
         let retained = try file("Library/Application Support/Example")
         let chosen = cleaner.scan(app).candidates.filter { $0.url == exact }
-        let outcome = cleaner.execute(chosen, app: app, permanent: true)
+        let outcome = await cleaner.execute(chosen, app: app, permanent: true)
         let after = cleaner.scan(app)
-        XCTAssertEqual(outcome.0, Set([exact.path]))
+        XCTAssertEqual(outcome.removed, Set([exact.path]))
         XCTAssertFalse(after.candidates.contains { $0.url == exact })
         XCTAssertTrue(after.candidates.contains { $0.url == retained })
     }
@@ -172,12 +281,19 @@ var failures = 0
 @MainActor func XCTAssertEqual<T: Equatable>(_ a: T, _ b: T, file: String = #file, line: Int = #line) { XCTAssertTrue(a == b, file: file, line: line) }
 @MainActor func XCTAssertNil<T>(_ value: T?, file: String = #file, line: Int = #line) { XCTAssertTrue(value == nil, file: file, line: line) }
 @MainActor func XCTAssertThrowsError<T>(_ work: @autoclosure () throws -> T, file: String = #file, line: Int = #line) { do { _ = try work(); XCTAssertTrue(false, file: file, line: line) } catch {} }
-let checks: [(String, @MainActor (CleanerTests) throws -> Void)] = [
-    ("generic bundle identity and post-removal snapshot", { try $0.testProductAliasesRemainUnselected() }),
+let checks: [(String, @MainActor (CleanerTests) async throws -> Void)] = [
+    ("native trash refusal and cancellation preserve data", { try await $0.testNativeTrashRefusalAndCancellationPreserveData() }),
+    ("native trash application precedes data", { try await $0.testNativeTrashApplicationBeforeData() }),
+    ("denied data prevents native trash", { try await $0.testDeniedDataPreventsNativeTrash() }),
+    ("trash destination and source verified", { try await $0.testTrashDestinationAndSourceAreVerified() }),
+    ("partial trash stops and reports failure", { try await $0.testPartialTrashStopsAndReportsFailure() }),
+    ("revalidate data after native prompt", { try await $0.testTrashRevalidatesAfterNativePrompt() }),
+    ("denied application preserves entire selection", { try await $0.testDeniedApplicationPreservesSelection() }),
+    ("generic bundle identity and post-removal snapshot", { try await $0.testProductAliasesRemainUnselected() }),
     ("launch service executable attribution", { try $0.testLaunchServiceUsesExecutableOnly() }),
     ("identity excludes symlinked components", { try $0.testIdentityDoesNotFollowSymlinks() }),
     ("application roots and system boundary", { try $0.testApplicationAndSystemBoundary() }),
-    ("post scan retains unselected data", { try $0.testPostScanShowsRetainedItems() }),
+    ("post scan retains unselected data", { try await $0.testPostScanShowsRetainedItems() }),
     ("identifier boundaries", { $0.testIdentifierBoundary() }),
     ("UUID preferences", { $0.testUUIDPreferences() }),
     ("protected roots and documents", { try $0.testProtectedRootsAndDocuments() }),
@@ -187,14 +303,14 @@ let checks: [(String, @MainActor (CleanerTests) throws -> Void)] = [
     ("changed file rejection", { try $0.testReplacedFileRejected() }),
     ("Apple app protection", { try $0.testAppleApplicationProtected() }),
     ("sibling path boundary", { $0.testBoundaryCannotMatchSiblingFolder() }),
-    ("synthetic permanent removal preserves unrelated data", { try $0.testPermanentRemovalOfSyntheticFixtureOnly() }),
-    ("preflight failure preserves all files", { try $0.testPreflightFailurePreservesAllFiles() }),
+    ("synthetic permanent removal preserves unrelated data", { try await $0.testPermanentRemovalOfSyntheticFixtureOnly() }),
+    ("preflight failure preserves all files", { try await $0.testPreflightFailurePreservesAllFiles() }),
     ("size symlink protection", { try $0.testSizeDoesNotFollowExternalSymlinks() })
 ]
 for (name, check) in checks {
     let suite = CleanerTests()
     let before = failures
-    do { try suite.setUpWithError(); try check(suite) } catch { failures += 1; print("FAIL \(name): \(error)") }
+    do { try suite.setUpWithError(); try await check(suite) } catch { failures += 1; print("FAIL \(name): \(error)") }
     do { try suite.tearDownWithError() } catch { failures += 1; print("Fixture cleanup failed: \(error)") }
     if failures == before { print("PASS \(name)") }
 }

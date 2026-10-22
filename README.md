@@ -64,7 +64,7 @@ zsh scripts/make-release.sh
 
 - `Sources/Core` : détection, validation des chemins et traitement des fichiers.
 - `Sources/App` : interface et confirmation utilisateur.
-- `Tests` : 17 contrôles sur des fichiers fictifs créés dans le dossier de travail.
+- `Tests` : 24 contrôles sur des fichiers fictifs créés dans le dossier de travail.
 - `scripts` : compilation et création du DMG, du ZIP et des sommes SHA-256.
 
 Les tests ne désinstallent aucun logiciel existant. La publication automatique d’une release se fait en poussant un tag `vX.Y.Z` correspondant à la version d’`Info.plist` : le workflow vérifie le code, compile l’application et joint les fichiers de distribution.

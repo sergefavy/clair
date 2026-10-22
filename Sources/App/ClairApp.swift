@@ -84,21 +84,32 @@ struct RemovalSelection: Identifiable {
         }
         let candidates = selection.candidates, cleaner = cleaner, app = selection.app
         busy = true; status = permanent ? "Suppression des éléments confirmés…" : "Déplacement vers la Corbeille…"
-        let outcome = await Task.detached(priority: .userInitiated) { () -> (Set<String>, String) in
-            cleaner.execute(candidates, app: app, permanent: permanent)
+        let outcome = await Task.detached(priority: .userInitiated) {
+            await cleaner.execute(candidates, app: app, permanent: permanent, recycle: { url in
+                try await Model.recycleWithFinder(url)
+            })
         }.value
         status = "Vérification après l’opération…"
         let verification = await Task.detached(priority: .userInitiated) { cleaner.scan(app) }.value
-        journal += outcome.1 + "\n\nVÉRIFICATION APRÈS OPÉRATION\n" + cleaner.report(verification) + "\n"
+        journal += outcome.log + "\n\nVÉRIFICATION APRÈS OPÉRATION\n" + cleaner.report(verification) + "\n"
         do {
             try FileManager.default.createDirectory(at: journalURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             try journal.write(to: journalURL, atomically: true, encoding: .utf8)
         } catch { journal += "\nÉCHEC DE SAUVEGARDE DU JOURNAL : \(error.localizedDescription)\n" }
         self.result = verification; checked = []; selected = app
-        if outcome.0.contains(app.url.path) { apps.removeAll { $0.id == app.id } }
+        if outcome.removed.contains(app.url.path) { apps.removeAll { $0.id == app.id } }
         busy = false
-        status = "\(outcome.0.count)/\(candidates.count) éléments vérifiés comme traités · \(verification.candidates.count) éléments encore repérés."
-        problem = status + "\n\nLe rapport affiche les éléments conservés et les limites d’accès. Les services et extensions peuvent rester actifs : leur état n’est pas vérifié par Clair."
+        status = (outcome.problem == nil ? "" : "Opération interrompue · ") + "\(outcome.removed.count)/\(candidates.count) éléments vérifiés comme traités · \(verification.candidates.count) éléments encore repérés."
+        problem = (outcome.problem.map { $0 + "\n\n" } ?? "") + status + "\n\nLe rapport affiche les éléments conservés et les limites d’accès. Les services et extensions peuvent rester actifs : leur état n’est pas vérifié par Clair."
+    }
+
+    /// AppKit owns any Finder UI and authentication; credentials never enter Clair.
+    private static func recycleWithFinder(_ url: URL) async throws -> URL {
+        let destinations = try await NSWorkspace.shared.recycle([url])
+        guard let destination = destinations[url] else {
+            throw CleanerError.unsafe("Le Finder n’a pas confirmé le déplacement de " + url.path)
+        }
+        return destination
     }
 
     func export(_ text: String, filename: String) {
@@ -280,7 +291,7 @@ struct ConfirmationView: View {
             Text("\(selection.candidates.count) éléments · \(size(selection.bytes)) estimés. Seuls les chemins ci-dessous seront traités.").foregroundStyle(.secondary)
             ScrollView { VStack(alignment: .leading, spacing: 7) { ForEach(selection.candidates) { Text($0.url.path).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) } } }.frame(height: 170).padding(12).background(.black.opacity(0.15)).clipShape(RoundedRectangle(cornerRadius: 10))
             Picker("Méthode", selection: $permanent) { Text("Déplacer dans la Corbeille").tag(false); Text("Supprimer définitivement").tag(true) }.pickerStyle(.segmented)
-            Text(permanent ? "Cette action est irréversible. Les données, réglages et sessions sélectionnés seront effacés." : "Les éléments seront déplacés dans la Corbeille. Clair ne vide jamais la Corbeille.").font(.callout).foregroundStyle(permanent ? Color.orange : Color.secondary)
+            Text(permanent ? "Cette action est irréversible. Les données, réglages et sessions sélectionnés seront effacés." : "Le Finder gère la Corbeille et peut demander une authentification macOS. Si l’application est sélectionnée, elle est traitée en premier : un refus conserve ses données. Un échec ultérieur peut laisser des éléments à nettoyer. Clair ne vide jamais la Corbeille.").font(.callout).foregroundStyle(permanent ? Color.orange : Color.secondary)
             Toggle("J’ai vérifié la liste et sauvegardé les données à conserver.", isOn: $acknowledged)
             if permanent {
                 Text("Saisis exactement « \(selection.app.name) » pour autoriser la suppression définitive.").font(.caption)

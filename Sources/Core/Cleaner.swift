@@ -57,20 +57,30 @@ public struct ScanResult: Sendable {
 }
 
 public enum CleanerError: LocalizedError {
-    case unsafe(String), changed(String)
+    case unsafe(String), changed(String), permission(String)
     public var errorDescription: String? {
         switch self {
         case .unsafe(let path): return "Chemin protégé ou non autorisé : \(path)"
+        case .permission(let path): return "Droits insuffisants : \(path). Pour une application protégée, choisis la Corbeille afin de laisser macOS gérer l’authentification. Si macOS refuse, utilise le Finder ou le désinstalleur de l’éditeur, puis relance l’analyse."
         case .changed(let path): return "Fichier modifié depuis l’analyse. Relance l’analyse : \(path)"
         }
     }
 }
 
+public struct RemovalOutcome: Sendable {
+    public let removed: Set<String>
+    public let log: String
+    public let problem: String?
+}
+
 public struct Cleaner: Sendable {
     public let home: URL
     public let applicationRoots: [URL]
+    private let canRemove: @Sendable (URL) -> Bool
     public init(home: URL = FileManager.default.homeDirectoryForCurrentUser,
-                applicationRoots: [URL]? = nil) {
+                applicationRoots: [URL]? = nil,
+                canRemove: @escaping @Sendable (URL) -> Bool = { FileManager.default.isDeletableFile(atPath: $0.path) }) {
+        self.canRemove = canRemove
         self.home = home.standardizedFileURL
         self.applicationRoots = applicationRoots ?? [URL(fileURLWithPath: "/Applications"), home.appendingPathComponent("Applications")]
     }
@@ -251,38 +261,71 @@ public struct Cleaner: Sendable {
     }
 
     /// Call only after the UI has obtained confirmation for this exact selection.
-    public func execute(_ candidates: [Candidate], app: InstalledApp, permanent: Bool) -> (Set<String>, String) {
-            var removed = Set<String>()
-            var lines = ["\n\(Date().formatted()) — \(app.name) — \(permanent ? "Suppression définitive" : "Corbeille")"]
-            // Validate the complete selection before starting. Revalidate each entry immediately before removal.
-            do { for candidate in candidates { try validate(candidate, app: app) } }
-            catch { return (removed, lines.joined(separator: "\n") + "\nANNULÉ : \(error.localizedDescription)") }
-            // App last: retain the application if its data cannot all be removed.
-            let ordered = candidates.sorted { ($0.evidence == .application ? 1 : 0) < ($1.evidence == .application ? 1 : 0) }
-            var failed = false
-            for candidate in ordered {
-                if failed && candidate.evidence == .application {
-                    lines.append("CONSERVÉ : \(candidate.url.path) (un autre élément a échoué)"); continue
+    /// A native recycler is supplied by the app; the core never requests elevated privileges itself.
+    public func execute(_ candidates: [Candidate], app: InstalledApp, permanent: Bool,
+                        recycle: (@Sendable (URL) async throws -> URL)? = nil) async -> RemovalOutcome {
+        var removed = Set<String>()
+        var lines = ["\n\(Date().formatted()) — \(app.name) — \(permanent ? "Suppression définitive" : "Corbeille")"]
+        // Check the complete selection before any mutation. Permission checks are advisory:
+        // the filesystem can change afterwards, so every operation must still handle failure.
+        do {
+            for candidate in candidates {
+                try validate(candidate, app: app)
+                if !canRemove(candidate.url) && (permanent || recycle == nil || candidate.url != app.url) {
+                    throw CleanerError.permission(candidate.url.path)
                 }
-                do {
-                    try validate(candidate, app: app)
-                    if permanent { try FileManager.default.removeItem(at: candidate.url) }
-                    else {
-                        var destination: NSURL?
-                        try FileManager.default.trashItem(at: candidate.url, resultingItemURL: &destination)
-                        guard let destination, FileManager.default.fileExists(atPath: destination.path ?? "") else {
-                            throw CleanerError.unsafe("Destination Corbeille non vérifiée pour " + candidate.url.path)
-                        }
-                        lines.append("DESTINATION CORBEILLE : \(destination.path ?? "")")
-                    }
-                    guard !FileManager.default.fileExists(atPath: candidate.url.path) else {
-                        throw CleanerError.changed(candidate.url.path)
-                    }
-                    removed.insert(candidate.id)
-                    lines.append("\(permanent ? "SUPPRIMÉ" : "CORBEILLE") : \(candidate.url.path)")
-                } catch { failed = true; lines.append("ÉCHEC : \(candidate.url.path) — \(error.localizedDescription)") }
             }
-            return (removed, lines.joined(separator: "\n"))
+        } catch {
+            let problem = "Opération annulée avant tout déplacement ou suppression. " + error.localizedDescription
+            return RemovalOutcome(removed: removed, log: lines.joined(separator: "\n") + "\nANNULÉ : " + problem, problem: problem)
+        }
+        // Trash the app first: Finder refusal/cancellation must leave its data untouched.
+        // Permanent deletion retains the app-last policy after the full permission preflight.
+        let ordered = candidates.sorted {
+            let lhs = $0.url == app.url ? (permanent ? 1 : -1) : 0
+            let rhs = $1.url == app.url ? (permanent ? 1 : -1) : 0
+            return lhs == rhs ? $0.url.path < $1.url.path : lhs < rhs
+        }
+        var problem: String?
+        for candidate in ordered {
+            do {
+                try Task.checkCancellation()
+                try validate(candidate, app: app)
+                if permanent {
+                    guard canRemove(candidate.url) else { throw CleanerError.permission(candidate.url.path) }
+                    try FileManager.default.removeItem(at: candidate.url)
+                } else {
+                    let destination: URL
+                    if let recycle { destination = try await recycle(candidate.url) }
+                    else {
+                        guard canRemove(candidate.url) else { throw CleanerError.permission(candidate.url.path) }
+                        var trashed: NSURL?
+                        try FileManager.default.trashItem(at: candidate.url, resultingItemURL: &trashed)
+                        guard let trashed else { throw CleanerError.unsafe("Destination Corbeille absente pour " + candidate.url.path) }
+                        destination = trashed as URL
+                    }
+                    guard destination.isFileURL, destination.standardizedFileURL != candidate.url,
+                          FileManager.default.fileExists(atPath: destination.path) else {
+                        throw CleanerError.unsafe("Destination Corbeille non vérifiée pour " + candidate.url.path)
+                    }
+                    lines.append("DESTINATION CORBEILLE : \(destination.path)")
+                }
+                guard !FileManager.default.fileExists(atPath: candidate.url.path) else { throw CleanerError.changed(candidate.url.path) }
+                removed.insert(candidate.id)
+                lines.append("\(permanent ? "SUPPRIMÉ" : "CORBEILLE") : \(candidate.url.path)")
+            } catch {
+                let count = "\(removed.count)/\(candidates.count) éléments vérifiés comme traités."
+                var failure = "Opération interrompue : " + count + "\n" + candidate.url.path + "\n" + error.localizedDescription
+                if candidate.url == app.url && !permanent {
+                    failure += "\nLes données associées n’ont pas été traitées. Si une authentification est nécessaire, laisse macOS la gérer ; en cas de refus, utilise le Finder ou le désinstalleur de l’éditeur."
+                }
+                problem = failure
+                lines.append("ÉCHEC : \(candidate.url.path) — \(error.localizedDescription)")
+                lines.append("ARRÊT : les éléments suivants ne sont pas traités. Relance l’analyse avant toute nouvelle tentative.")
+                break
+            }
+        }
+        return RemovalOutcome(removed: removed, log: lines.joined(separator: "\n"), problem: problem)
     }
 
     public func report(_ result: ScanResult) -> String {
