@@ -29,7 +29,7 @@ extension Cleaner {
         else if FileManager.default.fileExists(atPath: app.url.path) {
             app.identityNotes.append("Métadonnées inaccessibles : \(rootInfo.path)")
         }
-        let roots = ["Contents/PlugIns", "Contents/XPCServices", "Contents/Library", "Contents/Helpers"]
+        let roots = ["Contents/PlugIns", "Contents/XPCServices", "Contents/Library", "Contents/Helpers", "Contents/Frameworks"]
         for relative in roots {
             if Task.isCancelled { break }
             let root = app.url.appendingPathComponent(relative)

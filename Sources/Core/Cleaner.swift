@@ -194,8 +194,10 @@ public struct Cleaner: Sendable {
                         if let match = association(url, app: app) {
                             let evidence = match.0
                             let shared = relative == "Group Containers"
-                            add(url, category, shared ? .shared : evidence,
+                            let ownedBoundary = hasUserDataBoundary(url, app: app)
+                            add(url, category, shared ? .shared : (ownedBoundary ? evidence : .possible),
                                 shared ? "Peut être utilisé par plusieurs applications : suppression désactivée."
+                                : !ownedBoundary ? "Correspondance dans un dossier dont l’appartenance n’est pas établie : suppression désactivée. " + match.1
                                 : match.1)
                             continue
                         }
@@ -249,9 +251,25 @@ public struct Cleaner: Sendable {
                   !applicationRoots.contains(u) else { throw CleanerError.unsafe(u.path) }
             return
         }
-        let allowed = locations.filter { $0.0 != "Group Containers" }.map { home.appendingPathComponent("Library/" + $0.0) }
-        guard allowed.contains(where: { Self.isWithin(u, $0) }),
+        guard hasUserDataBoundary(u, app: app),
               association(u, app: app) != nil else { throw CleanerError.unsafe(u.path) }
+    }
+
+    // A matching basename inside another product's directory does not prove ownership.
+    // ByHost is a macOS preference layout, accepted only for the principal ID + UUID.
+    private func hasUserDataBoundary(_ url: URL, app: InstalledApp) -> Bool {
+        let parent = url.deletingLastPathComponent()
+        for (relative, _) in locations where relative != "Group Containers" {
+            let root = home.appendingPathComponent("Library/" + relative)
+            if parent == root { return true }
+            if relative == "Preferences", parent == root.appendingPathComponent("ByHost") {
+                let name = url.lastPathComponent.lowercased(), identifier = app.bundleID.lowercased()
+                guard identifier.contains("."), name.hasPrefix(identifier + "."), name.hasSuffix(".plist") else { return false }
+                let suffix = String(name.dropFirst(identifier.count + 1).dropLast(6))
+                return UUID(uuidString: suffix) != nil
+            }
+        }
+        return false
     }
 
     public func validate(_ candidate: Candidate, app: InstalledApp) throws {

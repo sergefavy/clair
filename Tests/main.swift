@@ -238,6 +238,46 @@ actor FixtureRecycler {
         XCTAssertTrue(scan.candidates.contains { $0.url.lastPathComponent == "unrelated-name.plist" && !$0.recommended && $0.removable })
         XCTAssertFalse(scan.candidates.contains { $0.url.lastPathComponent == "unrelated-document.plist" })
     }
+    func testFrameworkApplicationsAreDiscoveredConservatively() throws {
+        for name in ["Phone", "Chat", "Meeting"] {
+            try plist("Applications/Example.app/Contents/Frameworks/\(name).app/Contents/Info.plist",
+                      ["CFBundleIdentifier": "net.vendor.\(name.lowercased())", "CFBundleName": "Embedded\(name)"])
+        }
+        try plist("Applications/Example.app/Contents/Frameworks/ThirdParty.framework/Contents/Info.plist",
+                  ["CFBundleIdentifier": "org.thirdparty.runtime", "CFBundleName": "ThirdPartyRuntime"])
+        let component = try file("Library/Caches/net.vendor.phone")
+        let thirdParty = try file("Library/Caches/org.thirdparty.runtime")
+        let scan = cleaner.scan(app)
+        for name in ["Phone", "Chat", "Meeting"] {
+            XCTAssertTrue(scan.app.componentIDs.contains("net.vendor.\(name.lowercased())"))
+            XCTAssertTrue(scan.app.discoveredNames.contains("Embedded\(name)"))
+        }
+        XCTAssertTrue(scan.candidates.contains { $0.url == component && $0.evidence == .possible && !$0.recommended })
+        XCTAssertFalse(scan.app.componentIDs.contains("org.thirdparty.runtime"))
+        XCTAssertFalse(scan.app.discoveredNames.contains("ThirdPartyRuntime"))
+        XCTAssertFalse(scan.candidates.contains { $0.url == thirdParty })
+    }
+    func testNestedExactIdentifiersDoNotEstablishOwnership() throws {
+        var foreignFiles: [URL] = []
+        for location in ["Application Support", "Caches", "Preferences", "Logs", "HTTPStorages", "WebKit"] {
+            foreignFiles.append(try file("Library/\(location)/OtherProduct/org.example.product.plist"))
+            foreignFiles.append(try file("Library/\(location)/OtherProduct/Settings/org.example.product.plist"))
+        }
+        let byHost = try file("Library/Preferences/ByHost/org.example.product.11111111-2222-3333-4444-555555555555.plist")
+        for name in ["org.example.product.plist", "org.example.product.helper.plist", "Example.plist"] {
+            foreignFiles.append(try file("Library/Preferences/ByHost/\(name)"))
+        }
+        let rootPreference = try file("Library/Preferences/org.example.product.plist")
+        let scan = cleaner.scan(app)
+        for foreign in foreignFiles {
+            XCTAssertThrowsError(try cleaner.validatePath(foreign, app: scan.app))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: foreign.path))
+            XCTAssertTrue(scan.candidates.contains { $0.url == foreign && !$0.recommended && !$0.removable && $0.evidence == .possible })
+        }
+        XCTAssertTrue(scan.candidates.contains { $0.url == byHost && $0.recommended })
+        XCTAssertTrue(scan.candidates.contains { $0.url == rootPreference && $0.recommended })
+        try cleaner.validatePath(byHost, app: scan.app)
+    }
     func testIdentityDoesNotFollowSymlinks() throws {
         let outside = root.appendingPathComponent("outside")
         try plist("outside/Contents/Info.plist", ["CFBundleName": "ExternalEngine", "CFBundleIdentifier": "org.external.helper"])
@@ -291,6 +331,8 @@ let checks: [(String, @MainActor (CleanerTests) async throws -> Void)] = [
     ("denied application preserves entire selection", { try await $0.testDeniedApplicationPreservesSelection() }),
     ("generic bundle identity and post-removal snapshot", { try await $0.testProductAliasesRemainUnselected() }),
     ("launch service executable attribution", { try $0.testLaunchServiceUsesExecutableOnly() }),
+    ("framework applications and third-party identity boundary", { try $0.testFrameworkApplicationsAreDiscoveredConservatively() }),
+    ("nested identifiers require an ownership boundary", { try $0.testNestedExactIdentifiersDoNotEstablishOwnership() }),
     ("identity excludes symlinked components", { try $0.testIdentityDoesNotFollowSymlinks() }),
     ("application roots and system boundary", { try $0.testApplicationAndSystemBoundary() }),
     ("post scan retains unselected data", { try await $0.testPostScanShowsRetainedItems() }),
