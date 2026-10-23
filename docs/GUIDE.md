@@ -6,13 +6,17 @@ Application macOS native en français pour examiner une application et ses fichi
 
 Ouvrir `Clair.app`, sélectionner une application puis cliquer sur **Analyser**. Vérifier les chemins : le bouton dossier affiche chaque élément dans le Finder. Les données et sessions de l’application peuvent figurer dans la sélection. Sauvegarder ce qui doit être conservé.
 
+**Choisir une application…** ouvre le sélecteur macOS pour sélectionner un paquet `.app` absent de la liste. Hors de `/Applications` et `~/Applications`, ou pour un chemin passant par un lien symbolique, Clair affiche une analyse en lecture seule : aucune case de suppression ne peut être cochée, y compris pour les données associées. Le rapport reste exportable. Ce choix n’élargit pas le périmètre de suppression du moteur.
+
 **Examiner la suppression…** affiche la liste exacte et propose la Corbeille par défaut. Pour une suppression définitive, choisir cette méthode, cocher la vérification et saisir exactement le nom de l’application. Une confirmation est requise pour chaque application. Aucun traitement par lot ni vidage de la Corbeille. Annuler ne supprime rien.
 
 Quitter l’application ciblée avant de confirmer. Le journal indique les réussites et les erreurs ; l’exporter pour le conserver après la fermeture de Clair. Le rapport d’analyse n’est pas une preuve de suppression. Une opération peut réussir partiellement ; Clair s’arrête au premier échec et affiche le nombre d’éléments vérifiés comme traités.
 
-En mode Corbeille, le Finder traite d’abord le paquet de l’application lorsqu’il est sélectionné. macOS peut afficher son interface d’authentification. Si ce premier déplacement échoue ou est annulé, Clair ne traite aucune donnée associée. Si un déplacement suivant échoue, l’application peut déjà être dans la Corbeille et certaines données rester en place : consulter le journal, puis relancer l’analyse. Clair ne lit jamais le mot de passe.
+En mode Corbeille, Clair utilise l’API native de macOS et traite d’abord le paquet de l’application lorsqu’il est sélectionné. Cette API peut refuser le déplacement sans afficher de demande d’authentification ; Clair ne garantit pas l’apparition de cette demande. Si ce premier déplacement échoue ou est annulé, Clair ne traite aucune donnée associée. Si un déplacement suivant échoue, l’application peut déjà être dans la Corbeille et certaines données rester en place : consulter le journal, puis relancer l’analyse. Clair ne lit jamais le mot de passe.
 
-Avant toute opération, Clair contrôle les droits apparents de la sélection. La suppression définitive d’une application exigeant des droits supplémentaires est bloquée avant de toucher ses données : utiliser la Corbeille. Dans ce mode définitif, l’application reste traitée en dernier. Les droits peuvent changer après ce contrôle ; il ne garantit pas la réussite de chaque opération. En cas de refus persistant de macOS, utiliser le Finder ou le désinstalleur de l’éditeur.
+Après une interruption, le bouton **Afficher l’application dans le Finder** est proposé si le paquet est encore présent. Il affiche son emplacement, sans le supprimer. Si macOS refuse l’accès, poursuivre manuellement dans le Finder ou utiliser le désinstalleur de l’éditeur, puis relancer l’analyse dans Clair. Le message est une aide conditionnelle : une interruption peut aussi avoir une autre cause, indiquée dans l’erreur et le journal.
+
+Avant toute opération, Clair contrôle les droits apparents de la sélection. La suppression définitive d’une application exigeant des droits supplémentaires est bloquée avant de toucher ses données : utiliser le Finder ou le désinstalleur de l’éditeur. Dans ce mode définitif, l’application reste traitée en dernier. Les droits peuvent changer après ce contrôle ; il ne garantit pas la réussite de chaque opération, y compris en mode Corbeille.
 
 ## Périmètre réel
 
@@ -21,7 +25,7 @@ Avant toute opération, Clair contrôle les droits apparents de la sélection. L
 - Correspondances exactes d’identifiant proposées par défaut ; noms et composants dérivés à vérifier, décochés par défaut.
 - Group Containers repérés par nom/identifiant mais toujours protégés. Les groupes aux identifiants différents ne sont pas découverts automatiquement.
 - Composants correspondants jusqu’à trois niveaux de plusieurs dossiers `/Library` (dont SystemExtensions et certains dossiers de modules) signalés sans possibilité de suppression. Utiliser le désinstalleur de l’éditeur pour les services privilégiés, VPN, pilotes et extensions système.
-- Aucun service privilégié installé par Clair, aucun nettoyage global, aucune modification du shell ou de son PATH. La Corbeille utilise l’API native du Finder et ses éventuelles demandes d’authentification.
+- Aucun service privilégié installé par Clair, aucun nettoyage global, aucune modification du shell ou de son PATH. La Corbeille utilise l’API native de macOS ; Clair ne peut pas imposer une demande d’authentification ni contourner un refus d’accès.
 
 L’analyse est ciblée : au plus trois niveaux dans les catégories qui permettent une recherche imbriquée et 25 000 entrées par catégorie. Elle ne parcourt pas les autres conteneurs d’applications. Les liens symboliques ne sont pas suivis pour la suppression. Les dossiers protégés par macOS peuvent être inaccessibles ; le rapport indique les accès refusés. Clair ne demande pas automatiquement un accès complet au disque.
 

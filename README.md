@@ -23,6 +23,7 @@
 ## Fonctionnalités
 
 - **Analyse locale** des préférences, caches, journaux, conteneurs, données WebKit et autres emplacements usuels.
+- **Choix manuel d’une application** avec le sélecteur macOS ; hors de `/Applications` et `~/Applications`, l’ensemble de la sélection reste en lecture seule.
 - **Identification générique** : noms internes, exécutable, identifiants de composants embarqués et liens des agents de démarrage vers le paquet sélectionné, sans catalogue de marques.
 - **Sélection prudente** : les correspondances incertaines restent décochées ; les groupes partagés et composants système sont protégés.
 - **Confirmation explicite** : liste des chemins avant toute action ; saisie du nom pour une suppression définitive.
@@ -44,6 +45,8 @@ Les empreintes SHA-256 sont fournies avec chaque release pour contrôler l’int
 ## Avant de nettoyer
 
 Les fichiers sélectionnés peuvent contenir des données personnelles et des sessions : vérifie-les et sauvegarde ce que tu veux conserver. Quitte l’application ciblée avant de confirmer.
+
+macOS peut refuser un déplacement vers la Corbeille sans afficher de demande d’authentification. Après une interruption, Clair propose d’afficher l’application dans le Finder si elle est encore présente. Si le refus concerne les droits d’accès, utiliser le Finder ou le désinstalleur de l’éditeur, puis relancer l’analyse dans Clair.
 
 Clair ne garantit pas « zéro résidu ». Les fichiers portant un autre nom peuvent échapper à l’analyse. Les trousseaux, reçus d’installation, documents, données cloud, groupes partagés et composants système ne sont pas supprimés. Pour les VPN, pilotes ou services privilégiés, utilise le désinstalleur de l’éditeur.
 
