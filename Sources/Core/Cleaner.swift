@@ -336,7 +336,7 @@ public struct Cleaner: Sendable {
                 let count = "\(removed.count)/\(candidates.count) éléments vérifiés comme traités."
                 var failure = "Opération interrompue : " + count + "\n" + candidate.url.path + "\n" + error.localizedDescription
                 if candidate.url == app.url && !permanent {
-                    failure += "\nLes données associées n’ont pas été traitées. Si une authentification est nécessaire, laisse macOS la gérer ; en cas de refus, utilise le Finder ou le désinstalleur de l’éditeur."
+                    failure += "\nLes données associées n’ont pas été traitées. En cas de refus de macOS, utilise le Finder ou le désinstalleur de l’éditeur, puis relance l’analyse."
                 }
                 problem = failure
                 lines.append("ÉCHEC : \(candidate.url.path) — \(error.localizedDescription)")

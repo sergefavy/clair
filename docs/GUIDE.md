@@ -16,7 +16,7 @@ En mode Corbeille, Clair utilise l’API native de macOS et traite d’abord le 
 
 Après une interruption, le bouton **Afficher l’application dans le Finder** est proposé si le paquet est encore présent. Il affiche son emplacement, sans le supprimer. Si macOS refuse l’accès, poursuivre manuellement dans le Finder ou utiliser le désinstalleur de l’éditeur, puis relancer l’analyse dans Clair. Le message est une aide conditionnelle : une interruption peut aussi avoir une autre cause, indiquée dans l’erreur et le journal.
 
-Avant toute opération, Clair contrôle les droits apparents de la sélection. La suppression définitive d’une application exigeant des droits supplémentaires est bloquée avant de toucher ses données : utiliser le Finder ou le désinstalleur de l’éditeur. Dans ce mode définitif, l’application reste traitée en dernier. Les droits peuvent changer après ce contrôle ; il ne garantit pas la réussite de chaque opération, y compris en mode Corbeille.
+Avant toute opération, Clair contrôle les droits apparents de la sélection. La suppression définitive d’une application exigeant des droits supplémentaires est bloquée avant de toucher ses données : utiliser le Finder ou le désinstalleur de l’éditeur. Dans les deux modes, l’application est traitée en premier lorsqu’elle est sélectionnée, afin qu’un échec sur son paquet conserve ses données. Les droits peuvent changer après ce contrôle ; il ne garantit pas la réussite de chaque opération, y compris en mode Corbeille.
 
 ## Périmètre réel
 
