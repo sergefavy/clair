@@ -1,6 +1,23 @@
 import Foundation
 import ClairCore
 
+final class FixturePermissionTransition: @unchecked Sendable {
+    private let lock = NSLock()
+    private let appURL: URL
+    private var checked: [URL] = []
+    init(appURL: URL) { self.appURL = appURL }
+    func canRemove(_ url: URL) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        checked.append(url)
+        // The preflight succeeds; the app becomes non-removable on its next check.
+        return url != appURL || checked.filter { $0 == appURL }.count == 1
+    }
+    func calls() -> [URL] {
+        lock.lock(); defer { lock.unlock() }
+        return checked
+    }
+}
+
 actor FixtureRecycler {
     enum Behavior: Sendable { case move, refuse, cancel, missingDestination, sourceRetained, failData }
     let root: URL
@@ -126,6 +143,35 @@ actor FixtureRecycler {
         XCTAssertTrue(outcome.removed.isEmpty)
         XCTAssertTrue(FileManager.default.fileExists(atPath: appURL.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: data.path))
+    }
+    func testPermanentApplicationPermissionChangePreservesData() async throws {
+        let data = try file("Library/Caches/org.example.product")
+        let preference = try file("Library/Preferences/org.example.product.plist")
+        let appURL = app.url
+        let transition = FixturePermissionTransition(appURL: appURL)
+        let restricted = Cleaner(home: root, applicationRoots: [appURL.deletingLastPathComponent()],
+                                 canRemove: { transition.canRemove($0) })
+        let scan = restricted.scan(app)
+        // Present data first so execution must explicitly prioritize the application.
+        let chosen = [data, preference, appURL].compactMap { url in scan.candidates.first { $0.url == url } }
+        XCTAssertEqual(chosen.count, 3)
+        let outcome = await restricted.execute(chosen, app: app, permanent: true)
+        XCTAssertEqual(transition.calls(), [data, preference, appURL, appURL])
+        XCTAssertTrue(outcome.removed.isEmpty)
+        XCTAssertTrue(outcome.problem?.contains("0/3") == true)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: appURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: data.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: preference.path))
+    }
+    func testPermanentApplicationPrecedesData() async throws {
+        let data = try file("Library/Caches/org.example.product")
+        let appURL = app.url
+        let chosen = cleaner.scan(app).candidates.filter { $0.url == appURL || $0.url == data }
+        let outcome = await cleaner.execute(chosen.reversed(), app: app, permanent: true)
+        XCTAssertEqual(outcome.removed, Set([appURL.path, data.path]))
+        XCTAssertNil(outcome.problem)
+        let removedLines = outcome.log.components(separatedBy: "\n").filter { $0.hasPrefix("SUPPRIMÉ : ") }
+        XCTAssertEqual(removedLines, ["SUPPRIMÉ : " + appURL.path, "SUPPRIMÉ : " + data.path])
     }
     func testNativeTrashRefusalAndCancellationPreserveData() async throws {
         let data = try file("Library/Caches/org.example.product")
@@ -322,6 +368,8 @@ var failures = 0
 @MainActor func XCTAssertNil<T>(_ value: T?, file: String = #file, line: Int = #line) { XCTAssertTrue(value == nil, file: file, line: line) }
 @MainActor func XCTAssertThrowsError<T>(_ work: @autoclosure () throws -> T, file: String = #file, line: Int = #line) { do { _ = try work(); XCTAssertTrue(false, file: file, line: line) } catch {} }
 let checks: [(String, @MainActor (CleanerTests) async throws -> Void)] = [
+    ("permanent application permission transition preserves data", { try await $0.testPermanentApplicationPermissionChangePreservesData() }),
+    ("permanent application precedes data", { try await $0.testPermanentApplicationPrecedesData() }),
     ("native trash refusal and cancellation preserve data", { try await $0.testNativeTrashRefusalAndCancellationPreserveData() }),
     ("native trash application precedes data", { try await $0.testNativeTrashApplicationBeforeData() }),
     ("denied data prevents native trash", { try await $0.testDeniedDataPreventsNativeTrash() }),

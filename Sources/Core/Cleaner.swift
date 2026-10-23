@@ -61,7 +61,7 @@ public enum CleanerError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .unsafe(let path): return "Chemin protégé ou non autorisé : \(path)"
-        case .permission(let path): return "Droits insuffisants : \(path). Pour une application protégée, choisis la Corbeille afin de laisser macOS gérer l’authentification. Si macOS refuse, utilise le Finder ou le désinstalleur de l’éditeur, puis relance l’analyse."
+        case .permission(let path): return "Droits insuffisants : \(path). Pour une application protégée, essaie la Corbeille. Si macOS refuse, utilise le Finder ou le désinstalleur de l’éditeur, puis relance l’analyse."
         case .changed(let path): return "Fichier modifié depuis l’analyse. Relance l’analyse : \(path)"
         }
     }
@@ -297,11 +297,12 @@ public struct Cleaner: Sendable {
             let problem = "Opération annulée avant tout déplacement ou suppression. " + error.localizedDescription
             return RemovalOutcome(removed: removed, log: lines.joined(separator: "\n") + "\nANNULÉ : " + problem, problem: problem)
         }
-        // Trash the app first: Finder refusal/cancellation must leave its data untouched.
-        // Permanent deletion retains the app-last policy after the full permission preflight.
+        // Process the app first in both modes: permissions can change after preflight,
+        // and an app removal failure must leave all associated data untouched.
+        // Later data failures remain partial operations; this is not a transaction.
         let ordered = candidates.sorted {
-            let lhs = $0.url == app.url ? (permanent ? 1 : -1) : 0
-            let rhs = $1.url == app.url ? (permanent ? 1 : -1) : 0
+            let lhs = $0.url == app.url ? -1 : 0
+            let rhs = $1.url == app.url ? -1 : 0
             return lhs == rhs ? $0.url.path < $1.url.path : lhs < rhs
         }
         var problem: String?
