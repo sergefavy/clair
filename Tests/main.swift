@@ -358,6 +358,22 @@ actor FixtureRecycler {
         try FileManager.default.createSymbolicLink(at: folder.appendingPathComponent("link"), withDestinationURL: outside)
         XCTAssertEqual(cleaner.measure(folder).0, 0)
     }
+    func testSizeCountsFrameworkContentsWithSymlinks() throws {
+        let folder = root.appendingPathComponent("framework-measure")
+        for index in 0..<8 {
+            let framework = folder.appendingPathComponent("Component\(index).framework")
+            let payload = try file("framework-measure/Component\(index).framework/Versions/A/Resources/data")
+            try Data(repeating: 1, count: 1024).write(to: payload)
+            try FileManager.default.createSymbolicLink(at: framework.appendingPathComponent("Versions/Current"), withDestinationURL: framework.appendingPathComponent("Versions/A"))
+            try FileManager.default.createSymbolicLink(at: framework.appendingPathComponent("Resources"), withDestinationURL: framework.appendingPathComponent("Versions/Current/Resources"))
+        }
+        let outside = try file("external-directory/data")
+        try Data(repeating: 1, count: 16384).write(to: outside)
+        try FileManager.default.createSymbolicLink(at: folder.appendingPathComponent("External"), withDestinationURL: outside.deletingLastPathComponent())
+        let result = cleaner.measure(folder)
+        XCTAssertEqual(result.0, 8192)
+        XCTAssertFalse(result.1)
+    }
 }
 
 
@@ -395,7 +411,8 @@ let checks: [(String, @MainActor (CleanerTests) async throws -> Void)] = [
     ("sibling path boundary", { $0.testBoundaryCannotMatchSiblingFolder() }),
     ("synthetic permanent removal preserves unrelated data", { try await $0.testPermanentRemovalOfSyntheticFixtureOnly() }),
     ("preflight failure preserves all files", { try await $0.testPreflightFailurePreservesAllFiles() }),
-    ("size symlink protection", { try $0.testSizeDoesNotFollowExternalSymlinks() })
+    ("size symlink protection", { try $0.testSizeDoesNotFollowExternalSymlinks() }),
+    ("framework size with symlinks", { try $0.testSizeCountsFrameworkContentsWithSymlinks() })
 ]
 for (name, check) in checks {
     let suite = CleanerTests()

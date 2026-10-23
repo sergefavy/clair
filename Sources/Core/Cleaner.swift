@@ -159,7 +159,9 @@ public struct Cleaner: Sendable {
             count += 1
             if count > 150_000 { incomplete = true; break }
             guard let value = try? item.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]) else { incomplete = true; continue }
-            if value.isSymbolicLink == true { walk.skipDescendants(); continue }
+            // DirectoryEnumerator does not follow symlinks. Calling skipDescendants
+            // on one can skip a subsequent real directory (notably in frameworks).
+            if value.isSymbolicLink == true { continue }
             if value.isRegularFile == true { bytes += Int64(value.fileSize ?? 0) }
         }
         return (bytes, incomplete)
