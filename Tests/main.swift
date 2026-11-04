@@ -1,425 +1,345 @@
 import Foundation
 import ClairCore
 
-final class FixturePermissionTransition: @unchecked Sendable {
-    private let lock = NSLock()
-    private let appURL: URL
-    private var checked: [URL] = []
-    init(appURL: URL) { self.appURL = appURL }
-    func canRemove(_ url: URL) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        checked.append(url)
-        // The preflight succeeds; the app becomes non-removable on its next check.
-        return url != appURL || checked.filter { $0 == appURL }.count == 1
-    }
-    func calls() -> [URL] {
-        lock.lock(); defer { lock.unlock() }
-        return checked
-    }
+// Contrôles du moteur sur des fichiers fictifs, dans un dossier temporaire.
+// Aucun fichier réel n'est lu en écriture ni déplacé.
+
+struct Failure: Error, CustomStringConvertible { let description: String }
+func expect(_ condition: Bool, _ message: @autoclosure () -> String, line: Int = #line) throws {
+    if !condition { throw Failure(description: "ligne \(line) : \(message())") }
 }
 
-actor FixtureRecycler {
-    enum Behavior: Sendable { case move, refuse, cancel, missingDestination, sourceRetained, failData }
+/// Reçus simulés.
+struct FakeReceipts: ReceiptStore {
+    var ownersByPath: [String: [String]] = [:]
+    var ids: [String] = []
+    let forgotten: LockedSet
+    func owners(of path: String) -> [String] { ownersByPath[path] ?? [] }
+    func packageIDs() -> [String] { ids }
+    func exists(_ id: String) -> Bool { ids.contains(id) && !forgotten.contains(id) }
+}
+
+final class LockedSet: @unchecked Sendable {
+    private let lock = NSLock(); private var values = Set<String>()
+    func insert(_ v: String) { lock.lock(); values.insert(v); lock.unlock() }
+    func contains(_ v: String) -> Bool { lock.lock(); defer { lock.unlock() }; return values.contains(v) }
+}
+
+/// Corbeille simulée : déplace dans `trash/` et enregistre les appels.
+actor FakeBackend: RemovalBackend {
+    let trashDir: URL
+    let forgotten: LockedSet
+    var failUserTrash: Set<String> = []
+    var cancelAdmin = false
+    var calls: [String] = []
+    init(trashDir: URL, forgotten: LockedSet) { self.trashDir = trashDir; self.forgotten = forgotten }
+    func configure(failUserTrash: Set<String> = [], cancelAdmin: Bool = false) { self.failUserTrash = failUserTrash; self.cancelAdmin = cancelAdmin }
+    private func move(_ url: URL) throws {
+        try FileManager.default.createDirectory(at: trashDir, withIntermediateDirectories: true)
+        try FileManager.default.moveItem(at: url, to: trashDir.appendingPathComponent(UUID().uuidString + "-" + url.lastPathComponent))
+    }
+    func trash(_ url: URL) async throws {
+        calls.append("trash " + url.lastPathComponent)
+        if failUserTrash.contains(url.lastPathComponent) { throw CocoaError(.fileWriteNoPermission) }
+        try move(url)
+    }
+    func trashWithFinder(_ urls: [URL]) async throws {
+        calls.append("finder " + urls.map(\.lastPathComponent).joined(separator: ","))
+        if cancelAdmin { throw CleanerError.cancelled }
+        for u in urls { try move(u) }
+    }
+    func runAsAdmin(_ commands: [[String]]) async throws {
+        calls.append("admin " + commands.map { $0.joined(separator: " ") }.joined(separator: " ; "))
+        if cancelAdmin { throw CleanerError.cancelled }
+        for c in commands where c.count == 3 && c[1] == "--forget" { forgotten.insert(c[2]) }
+    }
+    func unloadUserService(_ plist: URL) async { calls.append("unload " + plist.lastPathComponent) }
+}
+
+final class Fixture {
     let root: URL
-    let appURL: URL
-    let behavior: Behavior
-    var calls: [URL] = []
-    init(root: URL, appURL: URL, behavior: Behavior = .move) {
-        self.root = root; self.appURL = appURL; self.behavior = behavior
+    let home: URL
+    let system: URL
+    let apps: URL
+    let forgotten = LockedSet()
+    var receipts: FakeReceipts
+    init() throws {
+        let base = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".build/clair-checks")
+        root = base.appendingPathComponent(UUID().uuidString)
+        home = root.appendingPathComponent("home")
+        system = root.appendingPathComponent("SystemLibrary")
+        apps = root.appendingPathComponent("Applications")
+        try FileManager.default.createDirectory(at: apps, withIntermediateDirectories: true)
+        receipts = FakeReceipts(forgotten: forgotten)
     }
-    func recycle(_ url: URL) throws -> URL {
-        calls.append(url)
-        if behavior == .cancel { throw CancellationError() }
-        if behavior == .refuse || (behavior == .failData && url != appURL) { throw CocoaError(.fileWriteNoPermission) }
-        let destination = root.appendingPathComponent("simulated-trash/" + url.lastPathComponent)
-        if behavior == .missingDestination { return destination }
-        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if behavior == .sourceRetained { try FileManager.default.copyItem(at: url, to: destination) }
-        else { try FileManager.default.moveItem(at: url, to: destination) }
-        return destination
-    }
-}
+    deinit { try? FileManager.default.removeItem(at: root) }
 
-@MainActor final class CleanerTests {
-    var root: URL!
-    var cleaner: Cleaner!
-    var app: InstalledApp!
-    func setUpWithError() throws {
-        root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("work/Clair-test-" + UUID().uuidString)
-        let apps = root.appendingPathComponent("Applications")
-        try FileManager.default.createDirectory(at: apps.appendingPathComponent("Example.app"), withIntermediateDirectories: true)
-        cleaner = Cleaner(home: root, applicationRoots: [apps])
-        app = InstalledApp(url: apps.appendingPathComponent("Example.app"), name: "Example", bundleID: "org.example.product")
+    var cleaner: Cleaner {
+        let system = system.path
+        return Cleaner(home: home, applicationRoots: [apps], systemLibrary: self.system, darwinDirectories: [],
+                       receipts: receipts,
+                       canRemove: { !$0.path.hasPrefix(system) },
+                       isInstalled: { $0 == "com.registered.elsewhere" })
     }
-    func tearDownWithError() throws { if let root { try FileManager.default.removeItem(at: root) } }
-    @discardableResult func file(_ relative: String) throws -> URL {
-        let url = root.appendingPathComponent(relative)
+    lazy var backend = FakeBackend(trashDir: root.appendingPathComponent("trash"), forgotten: forgotten)
+
+    @discardableResult func file(_ relative: String, in base: URL? = nil, contents: Data = Data("x".utf8)) throws -> URL {
+        let url = (base ?? home).appendingPathComponent(relative)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try Data("fixture".utf8).write(to: url)
+        try contents.write(to: url)
         return url
     }
-    func testIdentifierBoundary() {
-        XCTAssertEqual(cleaner.evidence(for: "org.example.product.plist", app: app), .identifier)
-        XCTAssertNil(cleaner.evidence(for: "org.example.productivity.plist", app: app))
-        XCTAssertEqual(cleaner.evidence(for: "org.example.product.helper.plist", app: app), .possible)
-        XCTAssertEqual(cleaner.evidence(for: "Example", app: app), .possible)
-        XCTAssertNil(cleaner.evidence(for: "Examples", app: app))
+    func plist(_ dict: [String: Any]) throws -> Data {
+        try PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0)
     }
-    func testUUIDPreferences() {
-        XCTAssertEqual(cleaner.evidence(for: "org.example.product.11111111-2222-3333-4444-555555555555.plist", app: app), .identifier)
-    }
-    func testProtectedRootsAndDocuments() throws {
-        XCTAssertThrowsError(try cleaner.validatePath(root.appendingPathComponent("Library/Caches"), app: app))
-        XCTAssertThrowsError(try cleaner.validatePath(file("Documents/Example"), app: app))
-        XCTAssertThrowsError(try cleaner.validatePath(file("Library/Group Containers/org.example.product"), app: app))
-        XCTAssertThrowsError(try cleaner.validatePath(URL(fileURLWithPath: "/Library/Caches/org.example.product"), app: app))
-    }
-    func testAncestorSymlinkRejected() throws {
-        let outside = root.appendingPathComponent("outside")
-        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: root.appendingPathComponent("Library"), withIntermediateDirectories: true)
-        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("Library/Caches"), withDestinationURL: outside)
-        let target = try file("Library/Caches/org.example.product")
-        XCTAssertThrowsError(try cleaner.validatePath(target, app: app))
-    }
-    func testAppSymlinkRejected() throws {
-        let link = root.appendingPathComponent("Applications/Link.app")
-        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: app.url)
-        let linked = InstalledApp(url: link, name: "Link", bundleID: "org.example.link")
-        XCTAssertThrowsError(try cleaner.validatePath(link, app: linked))
-    }
-    func testScanDoesNotDeleteAndDefaultsAreConservative() throws {
-        let exact = try file("Library/Caches/org.example.product")
-        let uncertain = try file("Library/Application Support/Example")
-        let shared = try file("Library/Group Containers/org.example.product")
-        let result = cleaner.scan(app)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: exact.path))
-        XCTAssertTrue(result.candidates.first { $0.url.path == exact.path }!.recommended)
-        XCTAssertFalse(result.candidates.first { $0.url.path == uncertain.path }!.recommended)
-        XCTAssertFalse(result.candidates.first { $0.url.path == shared.path }!.removable)
-        XCTAssertTrue(result.warnings.contains { $0.contains("autre nom") })
-    }
-    func testReplacedFileRejected() throws {
-        let exact = try file("Library/Caches/org.example.product")
-        let candidate = cleaner.scan(app).candidates.first { $0.url.path == exact.path }!
-        try cleaner.validate(candidate, app: app)
-        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 10)], ofItemAtPath: exact.path)
-        XCTAssertThrowsError(try cleaner.validate(candidate, app: app))
-    }
-    func testAppleApplicationProtected() throws {
-        let apple = InstalledApp(url: URL(fileURLWithPath: "/System/Applications/Example.app"), name: "Example", bundleID: "com.apple.example")
-        XCTAssertThrowsError(try cleaner.validatePath(app.url, app: apple))
-        XCTAssertTrue(cleaner.scan(apple).candidates.allSatisfy { !$0.removable })
-    }
-    func testBoundaryCannotMatchSiblingFolder() {
-        XCTAssertFalse(Cleaner.isWithin(root.appendingPathComponent("Library/CachesBackup/Example"), root.appendingPathComponent("Library/Caches")))
-    }
-    func testPermanentRemovalOfSyntheticFixtureOnly() async throws {
-        let exact = try file("Library/Caches/org.example.product")
-        let unrelated = try file("Library/Caches/org.example.unrelated")
-        let chosen = cleaner.scan(app).candidates.filter { $0.url.path == exact.path }
-        let outcome = await cleaner.execute(chosen, app: app, permanent: true)
-        XCTAssertEqual(outcome.removed.count, 1)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: exact.path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: app.url.path))
-    }
-    func testPreflightFailurePreservesAllFiles() async throws {
-        let a = try file("Library/Caches/org.example.product")
-        let b = try file("Library/Preferences/org.example.product.plist")
-        let chosen = cleaner.scan(app).candidates.filter { $0.url.path == a.path || $0.url.path == b.path }
-        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1)], ofItemAtPath: b.path)
-        let outcome = await cleaner.execute(chosen, app: app, permanent: true)
-        XCTAssertTrue(outcome.removed.isEmpty)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: a.path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: b.path))
-    }
-    func testDeniedApplicationPreservesSelection() async throws {
-        let data = try file("Library/Caches/org.example.product")
-        let appURL = app.url
-        let restricted = Cleaner(home: root, applicationRoots: [appURL.deletingLastPathComponent()], canRemove: { $0 != appURL })
-        let chosen = restricted.scan(app).candidates.filter { $0.url == appURL || $0.url == data }
-        let outcome = await restricted.execute(chosen, app: app, permanent: true)
-        XCTAssertTrue(outcome.removed.isEmpty)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: appURL.path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: data.path))
-    }
-    func testPermanentApplicationPermissionChangePreservesData() async throws {
-        let data = try file("Library/Caches/org.example.product")
-        let preference = try file("Library/Preferences/org.example.product.plist")
-        let appURL = app.url
-        let transition = FixturePermissionTransition(appURL: appURL)
-        let restricted = Cleaner(home: root, applicationRoots: [appURL.deletingLastPathComponent()],
-                                 canRemove: { transition.canRemove($0) })
-        let scan = restricted.scan(app)
-        // Present data first so execution must explicitly prioritize the application.
-        let chosen = [data, preference, appURL].compactMap { url in scan.candidates.first { $0.url == url } }
-        XCTAssertEqual(chosen.count, 3)
-        let outcome = await restricted.execute(chosen, app: app, permanent: true)
-        XCTAssertEqual(transition.calls(), [data, preference, appURL, appURL])
-        XCTAssertTrue(outcome.removed.isEmpty)
-        XCTAssertTrue(outcome.problem?.contains("0/3") == true)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: appURL.path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: data.path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: preference.path))
-    }
-    func testPermanentApplicationPrecedesData() async throws {
-        let data = try file("Library/Caches/org.example.product")
-        let appURL = app.url
-        let chosen = cleaner.scan(app).candidates.filter { $0.url == appURL || $0.url == data }
-        let outcome = await cleaner.execute(chosen.reversed(), app: app, permanent: true)
-        XCTAssertEqual(outcome.removed, Set([appURL.path, data.path]))
-        XCTAssertNil(outcome.problem)
-        let removedLines = outcome.log.components(separatedBy: "\n").filter { $0.hasPrefix("SUPPRIMÉ : ") }
-        XCTAssertEqual(removedLines, ["SUPPRIMÉ : " + appURL.path, "SUPPRIMÉ : " + data.path])
-    }
-    func testNativeTrashRefusalAndCancellationPreserveData() async throws {
-        let data = try file("Library/Caches/org.example.product")
-        let appURL = app.url
-        let restricted = Cleaner(home: root, applicationRoots: [appURL.deletingLastPathComponent()], canRemove: { $0 != appURL })
-        let chosen = restricted.scan(app).candidates.filter { $0.url == appURL || $0.url == data }
-        for behavior in [FixtureRecycler.Behavior.refuse, .cancel] {
-            let recycler = FixtureRecycler(root: root, appURL: appURL, behavior: behavior)
-            let outcome = await restricted.execute(chosen, app: app, permanent: false, recycle: { try await recycler.recycle($0) })
-            XCTAssertTrue(outcome.removed.isEmpty)
-            XCTAssertTrue(outcome.problem != nil)
-            XCTAssertEqual(await recycler.calls, [appURL])
-            XCTAssertTrue(FileManager.default.fileExists(atPath: data.path))
-            XCTAssertTrue(FileManager.default.fileExists(atPath: appURL.path))
-        }
-    }
-    func testNativeTrashApplicationBeforeData() async throws {
-        let data = try file("Library/Caches/org.example.product")
-        let appURL = app.url
-        let restricted = Cleaner(home: root, applicationRoots: [appURL.deletingLastPathComponent()], canRemove: { $0 != appURL })
-        let chosen = restricted.scan(app).candidates.filter { $0.url == appURL || $0.url == data }
-        let recycler = FixtureRecycler(root: root, appURL: appURL)
-        let outcome = await restricted.execute(chosen.reversed(), app: app, permanent: false, recycle: { try await recycler.recycle($0) })
-        XCTAssertEqual(await recycler.calls, [appURL, data])
-        XCTAssertEqual(outcome.removed, Set([appURL.path, data.path]))
-        XCTAssertNil(outcome.problem)
-        XCTAssertTrue(outcome.log.contains("DESTINATION CORBEILLE"))
-    }
-    func testDeniedDataPreventsNativeTrash() async throws {
-        let data = try file("Library/Caches/org.example.product")
-        let restricted = Cleaner(home: root, applicationRoots: [app.url.deletingLastPathComponent()], canRemove: { $0 != data })
-        let chosen = restricted.scan(app).candidates.filter { $0.url == app.url || $0.url == data }
-        let recycler = FixtureRecycler(root: root, appURL: app.url)
-        let outcome = await restricted.execute(chosen, app: app, permanent: false, recycle: { try await recycler.recycle($0) })
-        XCTAssertTrue(outcome.removed.isEmpty)
-        XCTAssertEqual(await recycler.calls, [])
-        XCTAssertTrue(FileManager.default.fileExists(atPath: data.path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: app.url.path))
-    }
-    func testTrashDestinationAndSourceAreVerified() async throws {
-        let data = try file("Library/Caches/org.example.product")
-        let chosen = cleaner.scan(app).candidates.filter { $0.url == app.url || $0.url == data }
-        for behavior in [FixtureRecycler.Behavior.missingDestination, .sourceRetained] {
-            let recycler = FixtureRecycler(root: root, appURL: app.url, behavior: behavior)
-            let outcome = await cleaner.execute(chosen, app: app, permanent: false, recycle: { try await recycler.recycle($0) })
-            XCTAssertTrue(outcome.removed.isEmpty)
-            XCTAssertTrue(outcome.problem != nil)
-            XCTAssertEqual(await recycler.calls, [app.url])
-            XCTAssertTrue(FileManager.default.fileExists(atPath: data.path))
-        }
-    }
-    func testPartialTrashStopsAndReportsFailure() async throws {
-        let data = try file("Library/Caches/org.example.product")
-        let remaining = try file("Library/Preferences/org.example.product.plist")
-        let chosen = cleaner.scan(app).candidates.filter { $0.url == app.url || $0.url == data || $0.url == remaining }
-        let recycler = FixtureRecycler(root: root, appURL: app.url, behavior: .failData)
-        let outcome = await cleaner.execute(chosen, app: app, permanent: false, recycle: { try await recycler.recycle($0) })
-        XCTAssertEqual(outcome.removed, Set([app.url.path]))
-        XCTAssertTrue(outcome.problem?.contains("1/3") == true)
-        XCTAssertEqual(await recycler.calls, [app.url, data])
-        XCTAssertTrue(FileManager.default.fileExists(atPath: data.path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: remaining.path))
-    }
-    func testTrashRevalidatesAfterNativePrompt() async throws {
-        let data = try file("Library/Caches/org.example.product")
-        let appURL = app.url
-        let chosen = cleaner.scan(app).candidates.filter { $0.url == appURL || $0.url == data }
-        let recycler = FixtureRecycler(root: root, appURL: appURL)
-        let outcome = await cleaner.execute(chosen, app: app, permanent: false, recycle: { url in
-            let destination = try await recycler.recycle(url)
-            if url == appURL { try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1)], ofItemAtPath: data.path) }
-            return destination
-        })
-        XCTAssertEqual(outcome.removed, Set([appURL.path]))
-        XCTAssertTrue(outcome.problem?.contains("Fichier modifié") == true)
-        XCTAssertEqual(await recycler.calls, [appURL])
-        XCTAssertTrue(FileManager.default.fileExists(atPath: data.path))
-    }
-    func plist(_ relative: String, _ values: [String: Any]) throws {
-        let url = try file(relative)
-        try PropertyListSerialization.data(fromPropertyList: values, format: .xml, options: 0).write(to: url)
-    }
-    func testProductAliasesRemainUnselected() async throws {
-        try plist("Applications/Example.app/Contents/Info.plist", ["CFBundleIdentifier": app.bundleID, "CFBundleExecutable": "LegacyEngine", "CFBundleName": "InternalProduct"])
-        try plist("Applications/Example.app/Contents/Library/SystemExtensions/Camera.systemextension/Contents/Info.plist", ["CFBundleIdentifier": "net.vendor.camera", "CFBundleName": "CameraEngine"])
-        let alias = try file("Library/Application Support/LegacyEngine")
-        let component = try file("Library/Caches/net.vendor.camera")
-        let unrelated = try file("Library/Application Support/Vendor")
-        let scan = cleaner.scan(app)
-        XCTAssertTrue(scan.candidates.contains { $0.url == alias && !$0.recommended && $0.removable })
-        XCTAssertTrue(scan.candidates.contains { $0.url == component && !$0.recommended })
-        XCTAssertFalse(scan.candidates.contains { $0.url == unrelated })
-        XCTAssertNil(cleaner.evidence(for: "ch.protonvpn.mac.WireGuard-Extension", app: scan.app))
-        XCTAssertTrue(scan.app.componentIDs.contains("net.vendor.camera"))
-        let selected = scan.candidates.filter { $0.url == alias }
-        let outcome = await cleaner.execute(selected, app: scan.app, permanent: true)
-        XCTAssertEqual(outcome.removed, Set([alias.path]))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.path))
-        // After the app is gone the original identity remains usable for the verification.
-        try FileManager.default.removeItem(at: app.url)
-        XCTAssertTrue(cleaner.scan(scan.app).candidates.contains { $0.url == component })
-    }
-    func testLaunchServiceUsesExecutableOnly() throws {
-        try plist("Applications/Example.app/Contents/Info.plist", ["CFBundleIdentifier": app.bundleID])
-        _ = try file("Applications/Example.app/Contents/MacOS/engine")
-        let path = app.url.appendingPathComponent("Contents/MacOS/engine").path
-        try plist("Library/LaunchAgents/unrelated-name.plist", ["ProgramArguments": [path, "--start"]])
-        try plist("Library/LaunchAgents/unrelated-document.plist", ["ProgramArguments": ["/usr/bin/open", path]])
-        let scan = cleaner.scan(app)
-        XCTAssertTrue(scan.candidates.contains { $0.url.lastPathComponent == "unrelated-name.plist" && !$0.recommended && $0.removable })
-        XCTAssertFalse(scan.candidates.contains { $0.url.lastPathComponent == "unrelated-document.plist" })
-    }
-    func testFrameworkApplicationsAreDiscoveredConservatively() throws {
-        for name in ["Phone", "Chat", "Meeting"] {
-            try plist("Applications/Example.app/Contents/Frameworks/\(name).app/Contents/Info.plist",
-                      ["CFBundleIdentifier": "net.vendor.\(name.lowercased())", "CFBundleName": "Embedded\(name)"])
-        }
-        try plist("Applications/Example.app/Contents/Frameworks/ThirdParty.framework/Contents/Info.plist",
-                  ["CFBundleIdentifier": "org.thirdparty.runtime", "CFBundleName": "ThirdPartyRuntime"])
-        let component = try file("Library/Caches/net.vendor.phone")
-        let thirdParty = try file("Library/Caches/org.thirdparty.runtime")
-        let scan = cleaner.scan(app)
-        for name in ["Phone", "Chat", "Meeting"] {
-            XCTAssertTrue(scan.app.componentIDs.contains("net.vendor.\(name.lowercased())"))
-            XCTAssertTrue(scan.app.discoveredNames.contains("Embedded\(name)"))
-        }
-        XCTAssertTrue(scan.candidates.contains { $0.url == component && $0.evidence == .possible && !$0.recommended })
-        XCTAssertFalse(scan.app.componentIDs.contains("org.thirdparty.runtime"))
-        XCTAssertFalse(scan.app.discoveredNames.contains("ThirdPartyRuntime"))
-        XCTAssertFalse(scan.candidates.contains { $0.url == thirdParty })
-    }
-    func testNestedExactIdentifiersDoNotEstablishOwnership() throws {
-        var foreignFiles: [URL] = []
-        for location in ["Application Support", "Caches", "Preferences", "Logs", "HTTPStorages", "WebKit"] {
-            foreignFiles.append(try file("Library/\(location)/OtherProduct/org.example.product.plist"))
-            foreignFiles.append(try file("Library/\(location)/OtherProduct/Settings/org.example.product.plist"))
-        }
-        let byHost = try file("Library/Preferences/ByHost/org.example.product.11111111-2222-3333-4444-555555555555.plist")
-        for name in ["org.example.product.plist", "org.example.product.helper.plist", "Example.plist"] {
-            foreignFiles.append(try file("Library/Preferences/ByHost/\(name)"))
-        }
-        let rootPreference = try file("Library/Preferences/org.example.product.plist")
-        let scan = cleaner.scan(app)
-        for foreign in foreignFiles {
-            XCTAssertThrowsError(try cleaner.validatePath(foreign, app: scan.app))
-            XCTAssertTrue(FileManager.default.fileExists(atPath: foreign.path))
-            XCTAssertTrue(scan.candidates.contains { $0.url == foreign && !$0.recommended && !$0.removable && $0.evidence == .possible })
-        }
-        XCTAssertTrue(scan.candidates.contains { $0.url == byHost && $0.recommended })
-        XCTAssertTrue(scan.candidates.contains { $0.url == rootPreference && $0.recommended })
-        try cleaner.validatePath(byHost, app: scan.app)
-    }
-    func testIdentityDoesNotFollowSymlinks() throws {
-        let outside = root.appendingPathComponent("outside")
-        try plist("outside/Contents/Info.plist", ["CFBundleName": "ExternalEngine", "CFBundleIdentifier": "org.external.helper"])
-        let plugins = app.url.appendingPathComponent("Contents/PlugIns")
-        try FileManager.default.createDirectory(at: plugins, withIntermediateDirectories: true)
-        try FileManager.default.createSymbolicLink(at: plugins.appendingPathComponent("Other.app"), withDestinationURL: outside)
-        let identity = cleaner.discoverIdentity(app)
-        XCTAssertFalse(identity.componentIDs.contains("org.external.helper"))
-        XCTAssertFalse(identity.discoveredNames.contains("ExternalEngine"))
-    }
-    func testApplicationAndSystemBoundary() throws {
-        let fcp = InstalledApp(url: app.url, name: "Example", bundleID: "com.apple.example")
-        try cleaner.validatePath(fcp.url, app: fcp)
-        let system = InstalledApp(url: URL(fileURLWithPath: "/System/Applications/Example.app"), name: fcp.name, bundleID: fcp.bundleID)
-        XCTAssertThrowsError(try cleaner.validatePath(system.url, app: system))
-    }
-    func testPostScanShowsRetainedItems() async throws {
-        let exact = try file("Library/Caches/org.example.product")
-        let retained = try file("Library/Application Support/Example")
-        let chosen = cleaner.scan(app).candidates.filter { $0.url == exact }
-        let outcome = await cleaner.execute(chosen, app: app, permanent: true)
-        let after = cleaner.scan(app)
-        XCTAssertEqual(outcome.removed, Set([exact.path]))
-        XCTAssertFalse(after.candidates.contains { $0.url == exact })
-        XCTAssertTrue(after.candidates.contains { $0.url == retained })
-    }
-    func testSizeDoesNotFollowExternalSymlinks() throws {
-        let folder = root.appendingPathComponent("measure")
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        let outside = try file("outside/large")
-        try Data(repeating: 1, count: 4096).write(to: outside)
-        try FileManager.default.createSymbolicLink(at: folder.appendingPathComponent("link"), withDestinationURL: outside)
-        XCTAssertEqual(cleaner.measure(folder).0, 0)
-    }
-    func testSizeCountsFrameworkContentsWithSymlinks() throws {
-        let folder = root.appendingPathComponent("framework-measure")
-        for index in 0..<8 {
-            let framework = folder.appendingPathComponent("Component\(index).framework")
-            let payload = try file("framework-measure/Component\(index).framework/Versions/A/Resources/data")
-            try Data(repeating: 1, count: 1024).write(to: payload)
-            try FileManager.default.createSymbolicLink(at: framework.appendingPathComponent("Versions/Current"), withDestinationURL: framework.appendingPathComponent("Versions/A"))
-            try FileManager.default.createSymbolicLink(at: framework.appendingPathComponent("Resources"), withDestinationURL: framework.appendingPathComponent("Versions/Current/Resources"))
-        }
-        let outside = try file("external-directory/data")
-        try Data(repeating: 1, count: 16384).write(to: outside)
-        try FileManager.default.createSymbolicLink(at: folder.appendingPathComponent("External"), withDestinationURL: outside.deletingLastPathComponent())
-        let result = cleaner.measure(folder)
-        XCTAssertEqual(result.0, 8192)
-        XCTAssertFalse(result.1)
+    /// Crée un paquet .app minimal.
+    func app(_ name: String, id: String, in folder: URL? = nil) throws -> InstalledApp {
+        let url = (folder ?? apps).appendingPathComponent(name + ".app")
+        try file("Contents/Info.plist", in: url, contents: plist(["CFBundleIdentifier": id, "CFBundleName": name, "CFBundleExecutable": name]))
+        try file("Contents/MacOS/" + name, in: url)
+        return InstalledApp(bundleAt: url)!
     }
 }
 
+func candidate(_ scan: AppScan, _ suffix: String) -> Candidate? { scan.candidates.first { $0.url.path.hasSuffix(suffix) } }
+
+// MARK: - Contrôles
+
+let checks: [(String, () async throws -> Void)] = [
+    ("identifiant exact : coché par défaut", {
+        let f = try Fixture(); let app = try f.app("Example", id: "org.example.product")
+        try f.file("Library/Preferences/org.example.product.plist")
+        try f.file("Library/Caches/org.example.product/data")
+        try f.file("Library/Containers/org.example.product/Data/x")
+        try f.file("Library/Saved Application State/org.example.product.savedState/x")
+        try f.file("Library/Preferences/ByHost/org.example.product.\(UUID().uuidString).plist")
+        try f.file("Library/Preferences/org.unrelated.app.plist")
+        let scan = f.cleaner.scan(app)
+        try expect(candidate(scan, "Example.app")?.evidence == .application, "app")
+        for s in ["Preferences/org.example.product.plist", "Caches/org.example.product", "Containers/org.example.product", "org.example.product.savedState"] {
+            try expect(candidate(scan, s)?.recommended == true, s)
+        }
+        try expect(scan.candidates.contains { $0.url.path.contains("ByHost") && $0.evidence == .identifier }, "ByHost")
+        try expect(candidate(scan, "org.unrelated.app.plist") == nil, "fichier sans rapport")
+    }),
+    ("préfixe d’identifiant : à vérifier, non coché", {
+        let f = try Fixture(); let app = try f.app("Example", id: "org.example.product")
+        try f.file("Library/Preferences/org.example.product.pro.plist")
+        let c = candidate(f.cleaner.scan(app), "org.example.product.pro.plist")
+        try expect(c?.evidence == .possible && c?.recommended == false, "\(String(describing: c?.evidence))")
+    }),
+    ("nom de l’application : coché ; nom interne : à vérifier", {
+        let f = try Fixture(); var app = try f.app("Example", id: "org.example.product")
+        app.discoveredNames = []
+        try f.file("Library/Application Support/Example/db")
+        try f.file("Library/Application Support/Electron/db")
+        let url = app.url.appendingPathComponent("Contents/Frameworks/Example Helper.app")
+        try f.file("Contents/Info.plist", in: url, contents: f.plist(["CFBundleIdentifier": "org.example.product.helper", "CFBundleExecutable": "Electron"]))
+        let scan = f.cleaner.scan(app)
+        try expect(candidate(scan, "Application Support/Example")?.evidence == .name, "nom")
+        try expect(candidate(scan, "Application Support/Electron")?.evidence == .possible, "nom interne")
+    }),
+    ("composants : même éditeur coché, autre éditeur à vérifier", {
+        let f = try Fixture(); let app = try f.app("Example", id: "org.example.product")
+        try f.file("Contents/Info.plist", in: app.url.appendingPathComponent("Contents/XPCServices/A.xpc"), contents: f.plist(["CFBundleIdentifier": "org.example.agent"]))
+        try f.file("Contents/Info.plist", in: app.url.appendingPathComponent("Contents/PlugIns/B.appex"), contents: f.plist(["CFBundleIdentifier": "net.thirdparty.kit"]))
+        try f.file("Library/Caches/org.example.agent/x")
+        try f.file("Library/Caches/net.thirdparty.kit/x")
+        let scan = f.cleaner.scan(app)
+        try expect(candidate(scan, "org.example.agent")?.evidence == .component, "même éditeur")
+        try expect(candidate(scan, "net.thirdparty.kit")?.evidence == .possible, "autre éditeur")
+    }),
+    ("services système et outil privilégié : détectés, droits requis", {
+        let f = try Fixture(); let app = try f.app("Zoomish", id: "us.zoomish.xos")
+        try f.file("Contents/Library/LaunchServices/us.zoomish.Daemon", in: app.url)
+        try f.file("LaunchDaemons/us.zoomish.Daemon.plist", in: f.system, contents: f.plist(["Label": "us.zoomish.Daemon", "Program": "/Library/PrivilegedHelperTools/us.zoomish.Daemon"]))
+        try f.file("PrivilegedHelperTools/us.zoomish.Daemon", in: f.system)
+        try f.file("LaunchAgents/weird-name.plist", in: f.home.appendingPathComponent("Library"), contents: f.plist(["Label": "x", "ProgramArguments": [app.url.path + "/Contents/MacOS/Zoomish"]]))
+        try f.file("LaunchAgents/other.plist", in: f.home.appendingPathComponent("Library"), contents: f.plist(["Label": "y", "ProgramArguments": ["/usr/bin/open", app.url.path]]))
+        let scan = f.cleaner.scan(app)
+        let daemon = candidate(scan, "LaunchDaemons/us.zoomish.Daemon.plist")
+        try expect(daemon?.evidence == .component && daemon?.requiresAdmin == true && daemon?.launchDomain == .system, "daemon \(String(describing: daemon))")
+        try expect(candidate(scan, "PrivilegedHelperTools/us.zoomish.Daemon")?.recommended == true, "helper")
+        try expect(candidate(scan, "weird-name.plist")?.launchDomain == .user, "agent lancé depuis l’app")
+        try expect(candidate(scan, "other.plist") == nil, "argument seulement : ignoré")
+    }),
+    ("groupes partagés et extensions système : jamais cochés", {
+        let f = try Fixture(); let app = try f.app("Example", id: "org.example.product")
+        try f.file("Library/Group Containers/ABCDE12345.org.example.product/x")
+        try f.file("SystemExtensions/org.example.product/x", in: f.system)
+        let scan = f.cleaner.scan(app)
+        try expect(candidate(scan, "ABCDE12345.org.example.product")?.evidence == .possible, "groupe")
+        try expect(candidate(scan, "SystemExtensions/org.example.product")?.removable == false, "extension")
+    }),
+    ("dossier d’éditeur imbriqué", {
+        let f = try Fixture(); let app = try f.app("Kontakt 7", id: "com.native-instruments.Kontakt 7")
+        try f.file("Library/Application Support/Native Instruments/Kontakt 7/db")
+        try f.file("Library/Application Support/Native Instruments/Massive/db")
+        try f.file("Library/Caches/Vendor Inc/Kontakt 7/x")
+        try f.file("Application Support/Native Instruments/Kontakt 7/x", in: f.system)
+        let cleaner = f.cleaner
+        let scan = cleaner.scan(app)
+        let mine = candidate(scan, "Native Instruments/Kontakt 7")
+        try expect(mine?.evidence == .name && mine?.recommended == true, "éditeur reconnu \(String(describing: mine?.evidence))")
+        try expect(candidate(scan, "Massive") == nil, "autre produit ignoré")
+        try expect(candidate(scan, "Vendor Inc/Kontakt 7")?.evidence == .possible, "dossier inconnu : à vérifier")
+        try expect(scan.candidates.first { $0.url.path.hasPrefix(f.system.path) }?.evidence == .possible, "système : à vérifier")
+        try cleaner.validate(mine!)
+    }),
+    ("rapports de plantage", {
+        let f = try Fixture(); let app = try f.app("Example", id: "org.example.product")
+        try f.file("Library/Logs/DiagnosticReports/Example-2026-11-03-175846.ips")
+        try f.file("Library/Logs/DiagnosticReports/Examplefoo-2026-11-03-175846.ips")
+        let scan = f.cleaner.scan(app)
+        try expect(candidate(scan, "Example-2026-11-03-175846.ips")?.evidence == .name, "rapport")
+        try expect(candidate(scan, "Examplefoo-2026-11-03-175846.ips") == nil, "autre processus")
+    }),
+    ("reçus d’installation", {
+        let f = try Fixture(); let app = try f.app("Zoomish", id: "us.zoomish.xos")
+        f.receipts.ownersByPath[app.url.path] = ["us.zoomish.pkg.meeting"]
+        f.receipts.ids = ["us.zoomish.pkg.meeting", "us.zoomish.pkg.plugin", "com.apple.pkg.Core", "org.other.pkg"]
+        let scan = f.cleaner.scan(app)
+        let receipts = scan.candidates.filter { if case .receipt = $0.kind { return true }; return false }
+        try expect(Set(receipts.map(\.id)) == ["receipt:us.zoomish.pkg.meeting", "receipt:us.zoomish.pkg.plugin"], "\(receipts.map(\.id))")
+        try expect(receipts.first { $0.id.hasSuffix("meeting") }?.recommended == true, "propriétaire coché")
+    }),
+    ("liens symboliques ignorés et refusés", {
+        let f = try Fixture(); let app = try f.app("Example", id: "org.example.product")
+        let target = try f.file("outside/keep.txt", in: f.root)
+        try FileManager.default.createDirectory(at: f.home.appendingPathComponent("Library/Caches"), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: f.home.appendingPathComponent("Library/Caches/org.example.product"), withDestinationURL: target.deletingLastPathComponent())
+        let scan = f.cleaner.scan(app)
+        try expect(candidate(scan, "Caches/org.example.product") == nil, "lien listé")
+        try expect(f.cleaner.measure(f.home.appendingPathComponent("Library/Caches/org.example.product")).0 == 0, "lien mesuré")
+    }),
+    ("applications Apple protégées", {
+        let f = try Fixture(); let app = try f.app("Notes", id: "com.apple.Notes")
+        try f.file("Library/Preferences/com.apple.Notes.plist")
+        let scan = f.cleaner.scan(app)
+        try expect(scan.candidates.allSatisfy { !$0.removable }, "protégé")
+    }),
+    ("exécution : ordre, droits, services, reçus", {
+        let f = try Fixture(); let app = try f.app("Zoomish", id: "us.zoomish.xos")
+        try f.file("Contents/Library/LaunchServices/us.zoomish.Daemon", in: app.url)
+        try f.file("LaunchDaemons/us.zoomish.Daemon.plist", in: f.system, contents: f.plist(["Program": "/Library/PrivilegedHelperTools/us.zoomish.Daemon"]))
+        try f.file("Library/Preferences/us.zoomish.xos.plist")
+        try f.file("Library/LaunchAgents/us.zoomish.xos.updater.plist")
+        let keep = try f.file("Library/Preferences/org.keep.me.plist")
+        f.receipts.ownersByPath[app.url.path] = ["us.zoomish.pkg"]; f.receipts.ids = ["us.zoomish.pkg"]
+        let cleaner = f.cleaner
+        let scan = cleaner.scan(app)
+        let chosen = scan.candidates.filter { $0.recommended || $0.url.lastPathComponent.contains("updater") }
+        let out = await cleaner.execute(chosen, backend: f.backend)
+        let calls = await f.backend.calls
+        try expect(out.failures.isEmpty && !out.cancelled, "\(out.failures)")
+        try expect(out.removed.count == chosen.count, "\(out.removed.count)/\(chosen.count)")
+        try expect(calls.first == "trash Zoomish.app", "app d’abord : \(calls)")
+        try expect(calls.contains { $0.hasPrefix("admin") && $0.contains("bootout system") && $0.contains("pkgutil --forget us.zoomish.pkg") }, "admin \(calls)")
+        try expect(calls.contains("finder us.zoomish.Daemon.plist"), "finder \(calls)")
+        try expect(calls.contains("unload us.zoomish.xos.updater.plist"), "agent arrêté")
+        try expect(FileManager.default.fileExists(atPath: keep.path), "fichier sans rapport conservé")
+    }),
+    ("refus de l’app par l’utilisateur : passage par le Finder", {
+        let f = try Fixture(); let app = try f.app("Example", id: "org.example.product")
+        try f.file("Library/Preferences/org.example.product.plist")
+        await f.backend.configure(failUserTrash: ["Example.app"])
+        let cleaner = f.cleaner
+        let out = await cleaner.execute(cleaner.scan(app).candidates.filter(\.recommended), backend: f.backend)
+        let calls = await f.backend.calls
+        try expect(out.removed.count == 2 && out.failures.isEmpty, "\(out.failures)")
+        try expect(calls.contains("finder Example.app"), "\(calls)")
+    }),
+    ("mot de passe annulé : les données restent intactes", {
+        let f = try Fixture(); let app = try f.app("Example", id: "org.example.product")
+        let pref = try f.file("Library/Preferences/org.example.product.plist")
+        await f.backend.configure(failUserTrash: ["Example.app"], cancelAdmin: true)
+        let cleaner = f.cleaner
+        let out = await cleaner.execute(cleaner.scan(app).candidates.filter(\.recommended), backend: f.backend)
+        try expect(out.cancelled && out.removed.isEmpty, "annulé")
+        try expect(FileManager.default.fileExists(atPath: pref.path) && FileManager.default.fileExists(atPath: app.url.path), "rien déplacé")
+    }),
+    ("élément modifié depuis l’analyse : aucune action", {
+        let f = try Fixture(); let app = try f.app("Example", id: "org.example.product")
+        let pref = try f.file("Library/Preferences/org.example.product.plist")
+        let cleaner = f.cleaner
+        let chosen = cleaner.scan(app).candidates.filter(\.recommended)
+        try FileManager.default.removeItem(at: pref); try f.file("Library/Preferences/org.example.product.plist")
+        let out = await cleaner.execute(chosen, backend: f.backend)
+        try expect(out.removed.isEmpty && !out.failures.isEmpty, "refusé")
+        try expect(FileManager.default.fileExists(atPath: app.url.path), "app intacte")
+        try expect(await f.backend.calls.isEmpty, "aucun appel")
+    }),
+    ("échec d’un fichier utilisateur : repris par le Finder", {
+        let f = try Fixture(); let app = try f.app("Example", id: "org.example.product")
+        try f.file("Library/Containers/org.example.product/x")
+        await f.backend.configure(failUserTrash: ["org.example.product"])
+        let cleaner = f.cleaner
+        let out = await cleaner.execute(cleaner.scan(app).candidates.filter(\.recommended), backend: f.backend)
+        try expect(out.failures.isEmpty && out.removed.count == 2, "\(out.failures)")
+        try expect(await f.backend.calls.contains("finder org.example.product"), "finder")
+    }),
+    ("validation : hors racines, imbriqué, Apple", {
+        let f = try Fixture(); let app = try f.app("Example", id: "org.example.product")
+        let cleaner = f.cleaner
+        let tooDeep = try f.file("Library/Application Support/Vendor/Sub/org.example.product/x").deletingLastPathComponent()
+        let nestedPrefs = try f.file("Library/Preferences/Vendor/org.example.product.plist")
+        let apple = try f.file("Library/Preferences/com.apple.finder.plist")
+        let outside = try f.file("Documents/org.example.product.plist")
+        for url in [tooDeep, nestedPrefs, apple, outside] {
+            let c = Candidate(url: url, kind: .file, category: "", evidence: .identifier, reason: "", bytes: 0, sizeIncomplete: false,
+                              stamp: try Stamp.read(url), requiresAdmin: false, launchDomain: nil)
+            var refused = false
+            do { try cleaner.validate(c) } catch { refused = true }
+            try expect(refused, url.path)
+        }
+        _ = app
+    }),
+    ("restes d’apps supprimées", {
+        let f = try Fixture()
+        _ = try f.app("Installed", id: "com.vendor.installed")
+        try f.file("Library/Preferences/org.gone.app.plist")
+        try f.file("Library/Caches/org.gone.app/x")
+        try f.file("Library/Application Support/org.gone.app.helper/x")
+        try f.file("Library/Preferences/com.vendor.installed.plist")
+        try f.file("Library/Preferences/com.vendor.installed.helper.plist")
+        try f.file("Library/Preferences/com.vendor.other.plist")
+        try f.file("Library/Preferences/com.apple.dock.plist")
+        try f.file("Library/Preferences/com.registered.elsewhere.plist")
+        try f.file("Library/Preferences/loginwindow.plist")
+        try f.file("Library/Group Containers/group.org.gone.app/x")
+        let cleaner = f.cleaner
+        let result = cleaner.scanOrphans(installed: cleaner.applications())
+        let ids = Set(result.groups.map(\.bundleID))
+        try expect(ids == ["org.gone.app", "com.vendor.other"], "\(ids)")
+        try expect(result.groups.first { $0.bundleID == "org.gone.app" }?.candidates.count == 3, "regroupement")
+        try expect(result.groups.first { $0.bundleID == "com.vendor.other" }?.sameVendorAs == "Installed", "même éditeur")
+        try expect(result.groups.flatMap(\.candidates).allSatisfy { !$0.recommended }, "rien coché par défaut")
+    }),
+    ("restes : plugins installés reconnus", {
+        let f = try Fixture()
+        try f.file("Audio/Plug-Ins/Components/Pro-Q 3.component/Contents/Info.plist", in: f.system,
+                   contents: f.plist(["CFBundleIdentifier": "com.fabfilter.Pro-Q.AU.3", "CFBundleName": "FabFilter Pro-Q 3"]))
+        try f.file("Library/Preferences/com.fabfilter.pro-q.3.plist")
+        try f.file("Library/Preferences/com.fabfilter.Pro-Q.AU.3.plist")
+        let cleaner = f.cleaner
+        let groups = cleaner.scanOrphans(installed: []).groups
+        try expect(groups.map(\.bundleID) == ["com.fabfilter.pro-q.3"], "\(groups.map(\.bundleID))")
+        try expect(groups.first?.sameVendorAs == "FabFilter Pro-Q 3", "même éditeur qu’un plugin")
+    }),
+    ("restes : suppression possible", {
+        let f = try Fixture()
+        let pref = try f.file("Library/Preferences/org.gone.app.plist")
+        let cleaner = f.cleaner
+        let group = cleaner.scanOrphans(installed: []).groups.first!
+        let out = await cleaner.execute(group.candidates, backend: f.backend)
+        try expect(out.removed.count == 1 && !FileManager.default.fileExists(atPath: pref.path), "\(out.failures)")
+    }),
+]
 
 var failures = 0
-@MainActor func XCTAssertTrue(_ condition: @autoclosure () -> Bool, file: String = #file, line: Int = #line) { if !condition() { failures += 1; print("FAIL \(file):\(line)") } }
-@MainActor func XCTAssertFalse(_ condition: @autoclosure () -> Bool, file: String = #file, line: Int = #line) { XCTAssertTrue(!condition(), file: file, line: line) }
-@MainActor func XCTAssertEqual<T: Equatable>(_ a: T, _ b: T, file: String = #file, line: Int = #line) { XCTAssertTrue(a == b, file: file, line: line) }
-@MainActor func XCTAssertNil<T>(_ value: T?, file: String = #file, line: Int = #line) { XCTAssertTrue(value == nil, file: file, line: line) }
-@MainActor func XCTAssertThrowsError<T>(_ work: @autoclosure () throws -> T, file: String = #file, line: Int = #line) { do { _ = try work(); XCTAssertTrue(false, file: file, line: line) } catch {} }
-let checks: [(String, @MainActor (CleanerTests) async throws -> Void)] = [
-    ("permanent application permission transition preserves data", { try await $0.testPermanentApplicationPermissionChangePreservesData() }),
-    ("permanent application precedes data", { try await $0.testPermanentApplicationPrecedesData() }),
-    ("native trash refusal and cancellation preserve data", { try await $0.testNativeTrashRefusalAndCancellationPreserveData() }),
-    ("native trash application precedes data", { try await $0.testNativeTrashApplicationBeforeData() }),
-    ("denied data prevents native trash", { try await $0.testDeniedDataPreventsNativeTrash() }),
-    ("trash destination and source verified", { try await $0.testTrashDestinationAndSourceAreVerified() }),
-    ("partial trash stops and reports failure", { try await $0.testPartialTrashStopsAndReportsFailure() }),
-    ("revalidate data after native prompt", { try await $0.testTrashRevalidatesAfterNativePrompt() }),
-    ("denied application preserves entire selection", { try await $0.testDeniedApplicationPreservesSelection() }),
-    ("generic bundle identity and post-removal snapshot", { try await $0.testProductAliasesRemainUnselected() }),
-    ("launch service executable attribution", { try $0.testLaunchServiceUsesExecutableOnly() }),
-    ("framework applications and third-party identity boundary", { try $0.testFrameworkApplicationsAreDiscoveredConservatively() }),
-    ("nested identifiers require an ownership boundary", { try $0.testNestedExactIdentifiersDoNotEstablishOwnership() }),
-    ("identity excludes symlinked components", { try $0.testIdentityDoesNotFollowSymlinks() }),
-    ("application roots and system boundary", { try $0.testApplicationAndSystemBoundary() }),
-    ("post scan retains unselected data", { try await $0.testPostScanShowsRetainedItems() }),
-    ("identifier boundaries", { $0.testIdentifierBoundary() }),
-    ("UUID preferences", { $0.testUUIDPreferences() }),
-    ("protected roots and documents", { try $0.testProtectedRootsAndDocuments() }),
-    ("ancestor symlinks", { try $0.testAncestorSymlinkRejected() }),
-    ("app symlinks", { try $0.testAppSymlinkRejected() }),
-    ("read-only scan and conservative selection", { try $0.testScanDoesNotDeleteAndDefaultsAreConservative() }),
-    ("changed file rejection", { try $0.testReplacedFileRejected() }),
-    ("Apple app protection", { try $0.testAppleApplicationProtected() }),
-    ("sibling path boundary", { $0.testBoundaryCannotMatchSiblingFolder() }),
-    ("synthetic permanent removal preserves unrelated data", { try await $0.testPermanentRemovalOfSyntheticFixtureOnly() }),
-    ("preflight failure preserves all files", { try await $0.testPreflightFailurePreservesAllFiles() }),
-    ("size symlink protection", { try $0.testSizeDoesNotFollowExternalSymlinks() }),
-    ("framework size with symlinks", { try $0.testSizeCountsFrameworkContentsWithSymlinks() })
-]
-for (name, check) in checks {
-    let suite = CleanerTests()
-    let before = failures
-    do { try suite.setUpWithError(); try await check(suite) } catch { failures += 1; print("FAIL \(name): \(error)") }
-    do { try suite.tearDownWithError() } catch { failures += 1; print("Fixture cleanup failed: \(error)") }
-    if failures == before { print("PASS \(name)") }
+for (name, run) in checks {
+    do { try await run(); print("OK    \(name)") }
+    catch { failures += 1; print("ÉCHEC \(name) — \(error)") }
 }
-print("\(checks.count) checks, \(failures) failures")
+print("\(checks.count) contrôles, \(failures) échec(s)")
 exit(failures == 0 ? 0 : 1)

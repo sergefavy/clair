@@ -1,6 +1,6 @@
 .build/
 .swiftpm/
-work/
 build/
+work/
 *.app/
 .DS_Store

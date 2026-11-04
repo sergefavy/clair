@@ -19,7 +19,7 @@ jobs:
           test "$RELEASE_TAG" = "v$version"
           test -f "release-notes/$RELEASE_TAG.md"
       - name: Tests
-        run: swift run --build-system native ClairChecks
+        run: swift run ClairChecks
       - name: Compiler
         run: zsh scripts/build.sh
       - name: Créer le DMG et les empreintes
