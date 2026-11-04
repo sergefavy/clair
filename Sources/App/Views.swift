@@ -112,6 +112,17 @@ struct Sidebar: View {
                         .font(.callout).foregroundStyle(.secondary)
                     Button { model.findLeftovers() } label: { Label("Relancer la recherche", systemImage: "arrow.clockwise") }
                         .disabled(model.working != nil)
+                    if model.fullDiskAccess {
+                        Label("Accès complet au disque actif", systemImage: "checkmark.shield").font(.caption).foregroundStyle(accent)
+                    } else {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Label("Accès complet au disque désactivé", systemImage: "exclamationmark.shield").foregroundStyle(.orange)
+                            Text("Sans lui, macOS empêche de retirer les conteneurs d’applications (dossier Containers). Après l’avoir activé, quitte et relance Clair.")
+                                .font(.caption).foregroundStyle(.secondary)
+                            Button("Ouvrir les réglages") { model.openFullDiskAccessSettings() }.controlSize(.small)
+                        }
+                        .padding(10).background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                    }
                     Spacer()
                 }
                 .padding(14)

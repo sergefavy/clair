@@ -6,19 +6,36 @@ struct SystemBackend: RemovalBackend {
     func trash(_ url: URL) async throws {
         do { try FileManager.default.trashItem(at: url, resultingItemURL: nil) }
         catch {
-            // EPERM (« Operation not permitted ») = protection des données de macOS, pas un problème
-            // de droits Unix (EACCES) : seul l'« Accès complet au disque » peut le lever.
-            if Self.isPOSIX(error, EPERM), url.pathExtension.lowercased() != "app" {
+            // Les conteneurs d'apps sont protégés par macOS : sans « Accès complet au disque »,
+            // même le Finder échoue (Cocoa 513 / OSStatus -5000). Inutile de le lui confier.
+            let parent = url.deletingLastPathComponent().lastPathComponent
+            let inContainers = ["Containers", "Group Containers"].contains(parent)
+            if url.pathExtension.lowercased() != "app",
+               Self.has(error, NSPOSIXErrorDomain, Int(EPERM)) || (inContainers && Self.isPermissionError(error)) {
                 throw CleanerError.needsFullDiskAccess(url.path)
             }
             throw error
         }
     }
 
-    private static func isPOSIX(_ error: Error, _ code: Int32) -> Bool {
+    /// « Accès complet au disque » : seul un processus autorisé peut lire la base TCC de l'utilisateur.
+    static func hasFullDiskAccess() -> Bool {
+        let tcc = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/com.apple.TCC/TCC.db")
+        guard let handle = try? FileHandle(forReadingFrom: tcc) else { return false }
+        try? handle.close()
+        return true
+    }
+
+    private static func isPermissionError(_ error: Error) -> Bool {
+        has(error, NSCocoaErrorDomain, CocoaError.fileWriteNoPermission.rawValue)
+            || has(error, NSOSStatusErrorDomain, -5000)
+            || has(error, NSPOSIXErrorDomain, Int(EACCES))
+    }
+
+    private static func has(_ error: Error, _ domain: String, _ code: Int) -> Bool {
         var current: NSError? = error as NSError
         while let e = current {
-            if e.domain == NSPOSIXErrorDomain, e.code == Int(code) { return true }
+            if e.domain == domain, e.code == code { return true }
             current = e.userInfo[NSUnderlyingErrorKey] as? NSError
         }
         return false

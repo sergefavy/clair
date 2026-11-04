@@ -26,6 +26,7 @@ struct Notice: Identifiable {
     /// Suppression en cours : aucune autre action ne doit l'interrompre.
     @Published var removing = false
     @Published var journal = ""
+    @Published var fullDiskAccess = SystemBackend.hasFullDiskAccess()
 
     let cleaner = Cleaner(isInstalled: Model.isInstalled)
     private var current: Task<Void, Never>?
@@ -111,6 +112,7 @@ struct Notice: Identifiable {
         guard !removing else { return }
         current?.cancel()
         mode = .leftovers
+        fullDiskAccess = SystemBackend.hasFullDiskAccess()
         orphans = nil; checked = []
         working = "Recherche des restes d’applications supprimées…"
         let cleaner = cleaner
@@ -166,9 +168,12 @@ struct Notice: Identifiable {
             if outcome.cancelled { message = "Opération annulée. " + message }
             if !outcome.failures.isEmpty { message += "\n\n" + outcome.failures.prefix(5).joined(separator: "\n") }
             let blocked = outcome.needsFullDiskAccess.count
+            let hasAccess = SystemBackend.hasFullDiskAccess()
             if blocked > 0 {
                 message += "\n\n\(blocked) élément\(blocked > 1 ? "s sont protégés" : " est protégé") par macOS (conteneurs d’applications). "
-                    + "Pour les retirer, donne à Clair l’« Accès complet au disque » dans Réglages Système, puis relance Clair et recommence."
+                message += hasAccess
+                    ? "Clair a pourtant l’« Accès complet au disque » : quitte Clair complètement puis relance-le pour que l’autorisation s’applique, et recommence."
+                    : "Pour les retirer, active Clair dans Réglages Système › Confidentialité et sécurité › Accès complet au disque, puis quitte et relance Clair, et recommence."
             }
             if moved > 0 { message += "\n\nTu peux les récupérer tant que la Corbeille n’est pas vidée." }
             let title = outcome.failures.isEmpty && !outcome.cancelled && blocked == 0 ? "C’est fait" : "Opération incomplète"
@@ -182,7 +187,7 @@ struct Notice: Identifiable {
             case .leftovers:
                 findLeftovers()
             }
-            notice = Notice(title: title, message: message, offerFullDiskAccess: blocked > 0)
+            notice = Notice(title: title, message: message, offerFullDiskAccess: blocked > 0 && !hasAccess)
         }
     }
 
