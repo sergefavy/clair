@@ -258,16 +258,15 @@ let checks: [(String, () async throws -> Void)] = [
         try expect(out.cancelled && out.removed.isEmpty, "annulé")
         try expect(FileManager.default.fileExists(atPath: pref.path) && FileManager.default.fileExists(atPath: app.url.path), "rien déplacé")
     }),
-    ("élément modifié depuis l’analyse : aucune action", {
+    ("élément modifié depuis l’analyse : conservé, le reste continue", {
         let f = try Fixture(); let app = try f.app("Example", id: "org.example.product")
         let pref = try f.file("Library/Preferences/org.example.product.plist")
         let cleaner = f.cleaner
         let chosen = cleaner.scan(app).candidates.filter(\.recommended)
         try FileManager.default.removeItem(at: pref); try f.file("Library/Preferences/org.example.product.plist")
         let out = await cleaner.execute(chosen, backend: f.backend)
-        try expect(out.removed.isEmpty && !out.failures.isEmpty, "refusé")
-        try expect(FileManager.default.fileExists(atPath: app.url.path), "app intacte")
-        try expect(await f.backend.calls.isEmpty, "aucun appel")
+        try expect(out.removed == [app.url.path] && out.failures.count == 1, "\(out.removed) \(out.failures)")
+        try expect(FileManager.default.fileExists(atPath: pref.path), "fichier modifié conservé")
     }),
     ("échec d’un fichier utilisateur : repris par le Finder", {
         let f = try Fixture(); let app = try f.app("Example", id: "org.example.product")
@@ -277,6 +276,39 @@ let checks: [(String, () async throws -> Void)] = [
         let out = await cleaner.execute(cleaner.scan(app).candidates.filter(\.recommended), backend: f.backend)
         try expect(out.failures.isEmpty && out.removed.count == 2, "\(out.failures)")
         try expect(await f.backend.calls.contains("finder org.example.product"), "finder")
+    }),
+    ("dossier atteint par un lien (/var → /private/var) : accepté", {
+        let f = try Fixture()
+        let realDir = f.root.appendingPathComponent("private/var/folders/C")
+        let item = try f.file("org.gone.app/x", in: realDir).deletingLastPathComponent()
+        try FileManager.default.createSymbolicLink(at: f.root.appendingPathComponent("var"), withDestinationURL: f.root.appendingPathComponent("private/var"))
+        let alias = f.root.appendingPathComponent("var/folders/C")
+        let cleaner = Cleaner(home: f.home, applicationRoots: [f.apps], systemLibrary: f.system, darwinDirectories: [alias], receipts: f.receipts)
+        // macOS peut présenter l'élément par le chemin du lien.
+        let viaAlias = alias.appendingPathComponent("org.gone.app")
+        let c = Candidate(url: viaAlias, kind: .file, category: "", evidence: .possible, reason: "", bytes: 0, sizeIncomplete: false,
+                          stamp: try Stamp.read(viaAlias), requiresAdmin: false, launchDomain: nil)
+        try cleaner.validate(c)
+        // Un élément qui est lui-même un lien reste refusé.
+        let link = realDir.appendingPathComponent("org.link.app")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: item)
+        let l = Candidate(url: link, kind: .file, category: "", evidence: .possible, reason: "", bytes: 0, sizeIncomplete: false,
+                          stamp: try Stamp.read(link), requiresAdmin: false, launchDomain: nil)
+        var refused = false
+        do { try cleaner.validate(l) } catch { refused = true }
+        try expect(refused, "lien refusé")
+        let out = await cleaner.execute([c, l], backend: f.backend)
+        try expect(out.removed == [c.id] && out.failures.count == 1, "un refus n’empêche pas le reste : \(out.removed) \(out.failures)")
+    }),
+    ("application refusée : rien n’est touché", {
+        let f = try Fixture(); let app = try f.app("Example", id: "org.example.product")
+        let pref = try f.file("Library/Preferences/org.example.product.plist")
+        let cleaner = f.cleaner
+        let chosen = cleaner.scan(app).candidates.filter(\.recommended)
+        try FileManager.default.removeItem(at: app.url); _ = try f.app("Example", id: "org.example.product")
+        let out = await cleaner.execute(chosen, backend: f.backend)
+        try expect(out.removed.isEmpty && FileManager.default.fileExists(atPath: pref.path), "données intactes")
+        try expect(await f.backend.calls.isEmpty, "aucun appel")
     }),
     ("validation : hors racines, imbriqué, Apple", {
         let f = try Fixture(); let app = try f.app("Example", id: "org.example.product")

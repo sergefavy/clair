@@ -25,13 +25,18 @@ extension Cleaner {
     }
 
     /// Un fichier doit être un enfant direct d'une racine connue (ou un petit-enfant d'une racine
-    /// « Éditeur/Application »), sans aucun lien symbolique dans son chemin.
+    /// « Éditeur/Application »), et ne pas être lui-même un lien symbolique.
+    /// La comparaison se fait sur les chemins réels : macOS présente indifféremment
+    /// « /var/folders » ou « /private/var/folders » pour le même dossier.
     func validateLocation(_ url: URL) throws {
         let path = url.standardizedFileURL.path
-        let parentURL = url.deletingLastPathComponent().standardizedFileURL
-        let parent = parentURL.path, grandparent = parentURL.deletingLastPathComponent().path
-        guard Paths.real(path) == path, !Self.isAppleID(Self.baseName(url.lastPathComponent)),
-              roots.contains(where: { !$0.protected && ($0.url.path == parent || ($0.nested && $0.url.path == grandparent)) })
+        let name = url.lastPathComponent
+        let parentURL = url.deletingLastPathComponent()
+        guard let realParent = Paths.real(parentURL.path), let realItem = Paths.real(path),
+              realItem == realParent + "/" + name, // l'élément n'est pas un lien
+              !Self.isAppleID(Self.baseName(name)) else { throw CleanerError.unsafe(path) }
+        let realGrandparent = URL(fileURLWithPath: realParent).deletingLastPathComponent().path
+        guard roots.contains(where: { !$0.protected && ($0.url.path == realParent || ($0.nested && $0.url.path == realGrandparent)) })
         else { throw CleanerError.unsafe(path) }
     }
 
@@ -51,7 +56,8 @@ extension Cleaner {
 
     private func isGone(_ candidate: Candidate) -> Bool {
         if case .receipt(let id) = candidate.kind { return !receipts.exists(id) }
-        return !FileManager.default.fileExists(atPath: candidate.url.path)
+        // Ne suit pas un éventuel lien final : un lien cassé existe encore.
+        return (try? FileManager.default.attributesOfItem(atPath: candidate.url.path)) == nil
     }
 
     // MARK: - Exécution
@@ -71,15 +77,22 @@ extension Cleaner {
             return RemovalOutcome(removed: removed, failures: failures, cancelled: cancelled, log: log.joined(separator: "\n"))
         }
 
-        // Tout est revalidé avant la première modification.
-        do { for c in selection { try validate(c) } }
-        catch {
-            log.append("Aucune modification : " + (error.localizedDescription))
-            return RemovalOutcome(removed: [], failures: [error.localizedDescription], cancelled: false, log: log.joined(separator: "\n"))
+        // Tout est revalidé avant la première modification. Un élément refusé est écarté et
+        // signalé ; si c'est l'application, rien n'est touché (ses données doivent rester intactes).
+        var failures: [String] = []
+        var valid: [Candidate] = []
+        for c in selection {
+            do { try validate(c); valid.append(c) }
+            catch {
+                if c.kind == .app {
+                    log.append("Aucune modification : " + error.localizedDescription)
+                    return RemovalOutcome(removed: [], failures: [error.localizedDescription], cancelled: false, log: log.joined(separator: "\n"))
+                }
+                failures.append(error.localizedDescription)
+            }
         }
 
-        var failures: [String] = []
-        let app = selection.first { $0.kind == .app }
+        let app = valid.first { $0.kind == .app }
         var finderBatch: [Candidate] = []
 
         // 1. Application.
@@ -92,7 +105,7 @@ extension Cleaner {
         }
 
         // 2. Éléments privilégiés : arrêt des services et oubli des reçus, puis Corbeille via le Finder.
-        let privileged = selection.filter { $0.kind != .app && $0.requiresAdmin }
+        let privileged = valid.filter { $0.kind != .app && $0.requiresAdmin }
         var commands: [[String]] = []
         for c in privileged {
             switch c.kind {
@@ -118,7 +131,7 @@ extension Cleaner {
 
         // 3. Éléments de l'utilisateur.
         var retry: [Candidate] = []
-        for c in selection where c.kind == .file && !c.requiresAdmin {
+        for c in valid where c.kind == .file && !c.requiresAdmin {
             if Task.isCancelled { break }
             if c.launchDomain == .user { await backend.unloadUserService(c.url) }
             do { try await backend.trash(c.url) } catch { retry.append(c) }
@@ -128,7 +141,7 @@ extension Cleaner {
             catch CleanerError.cancelled { return outcome(failures, cancelled: true) }
             catch { failures.append(error.localizedDescription) }
         }
-        for c in selection where !isGone(c) && !failures.contains(where: { $0.contains(c.url.path) }) {
+        for c in valid where !isGone(c) && !failures.contains(where: { $0.contains(c.url.path) }) {
             failures.append("Toujours présent : \(c.url.path)")
         }
         return outcome(failures)

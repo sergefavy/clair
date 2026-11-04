@@ -17,7 +17,9 @@ struct ClairApp: App {
 func runCommandLine(_ arguments: [String]) {
     let cleaner = Cleaner(isInstalled: Model.isInstalled)
     func line(_ c: Candidate) -> String {
-        "\(c.recommended ? "[x]" : c.removable ? "[ ]" : "[-]") \(c.evidence.rawValue) · \(formatSize(c.bytes))\(c.requiresAdmin ? " · admin" : "")\n    \(c.url.path)\n    \(c.reason)"
+        var refused = ""
+        if c.removable { do { try cleaner.validate(c) } catch { refused = "\n    REFUSÉ : \(error.localizedDescription)" } }
+        return "\(c.recommended ? "[x]" : c.removable ? "[ ]" : "[-]") \(c.evidence.rawValue) · \(formatSize(c.bytes))\(c.requiresAdmin ? " · admin" : "")\n    \(c.url.path)\n    \(c.reason)" + refused
     }
     if arguments.first == "--restes" {
         let result = cleaner.scanOrphans(installed: cleaner.applications())
