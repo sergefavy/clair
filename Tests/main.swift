@@ -30,10 +30,13 @@ actor FakeBackend: RemovalBackend {
     let trashDir: URL
     let forgotten: LockedSet
     var failUserTrash: Set<String> = []
+    var protectedByMacOS: Set<String> = []
     var cancelAdmin = false
     var calls: [String] = []
     init(trashDir: URL, forgotten: LockedSet) { self.trashDir = trashDir; self.forgotten = forgotten }
-    func configure(failUserTrash: Set<String> = [], cancelAdmin: Bool = false) { self.failUserTrash = failUserTrash; self.cancelAdmin = cancelAdmin }
+    func configure(failUserTrash: Set<String> = [], cancelAdmin: Bool = false, protectedByMacOS: Set<String> = []) {
+        self.failUserTrash = failUserTrash; self.cancelAdmin = cancelAdmin; self.protectedByMacOS = protectedByMacOS
+    }
     private func move(_ url: URL) throws {
         try FileManager.default.createDirectory(at: trashDir, withIntermediateDirectories: true)
         try FileManager.default.moveItem(at: url, to: trashDir.appendingPathComponent(UUID().uuidString + "-" + url.lastPathComponent))
@@ -41,6 +44,7 @@ actor FakeBackend: RemovalBackend {
     func trash(_ url: URL) async throws {
         calls.append("trash " + url.lastPathComponent)
         if failUserTrash.contains(url.lastPathComponent) { throw CocoaError(.fileWriteNoPermission) }
+        if protectedByMacOS.contains(url.lastPathComponent) { throw CleanerError.needsFullDiskAccess(url.path) }
         try move(url)
     }
     func trashWithFinder(_ urls: [URL]) async throws {
@@ -309,6 +313,17 @@ let checks: [(String, () async throws -> Void)] = [
         let out = await cleaner.execute(chosen, backend: f.backend)
         try expect(out.removed.isEmpty && FileManager.default.fileExists(atPath: pref.path), "données intactes")
         try expect(await f.backend.calls.isEmpty, "aucun appel")
+    }),
+    ("conteneur protégé par macOS : signalé, pas envoyé au Finder", {
+        let f = try Fixture()
+        try f.file("Library/Containers/org.gone.app/x")
+        try f.file("Library/Preferences/org.gone.app.plist")
+        await f.backend.configure(protectedByMacOS: ["org.gone.app"])
+        let cleaner = f.cleaner
+        let out = await cleaner.execute(cleaner.scanOrphans(installed: []).groups.flatMap(\.candidates), backend: f.backend)
+        let calls = await f.backend.calls
+        try expect(out.removed.count == 1 && out.needsFullDiskAccess.count == 1 && out.failures.isEmpty, "\(out.failures) \(out.needsFullDiskAccess)")
+        try expect(!calls.contains { $0.hasPrefix("finder") }, "pas de Finder : \(calls)")
     }),
     ("validation : hors racines, imbriqué, Apple", {
         let f = try Fixture(); let app = try f.app("Example", id: "org.example.product")

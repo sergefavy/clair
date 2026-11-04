@@ -4,7 +4,24 @@ import ClairCore
 /// Opérations réelles : Corbeille, Finder (avec mot de passe si besoin), commandes administrateur.
 struct SystemBackend: RemovalBackend {
     func trash(_ url: URL) async throws {
-        try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        do { try FileManager.default.trashItem(at: url, resultingItemURL: nil) }
+        catch {
+            // EPERM (« Operation not permitted ») = protection des données de macOS, pas un problème
+            // de droits Unix (EACCES) : seul l'« Accès complet au disque » peut le lever.
+            if Self.isPOSIX(error, EPERM), url.pathExtension.lowercased() != "app" {
+                throw CleanerError.needsFullDiskAccess(url.path)
+            }
+            throw error
+        }
+    }
+
+    private static func isPOSIX(_ error: Error, _ code: Int32) -> Bool {
+        var current: NSError? = error as NSError
+        while let e = current {
+            if e.domain == NSPOSIXErrorDomain, e.code == Int(code) { return true }
+            current = e.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+        return false
     }
 
     /// Le Finder demande lui-même le mot de passe et possède la permission « Gestion des apps ».

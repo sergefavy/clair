@@ -2,7 +2,8 @@ import Foundation
 
 /// Opérations système fournies par l'application (ou simulées par les tests).
 public protocol RemovalBackend: Sendable {
-    /// Déplace dans la Corbeille avec les droits de l'utilisateur.
+    /// Déplace dans la Corbeille avec les droits de l'utilisateur. Lance `CleanerError.needsFullDiskAccess`
+    /// si la protection des données de macOS bloque (le Finder échouerait aussi).
     func trash(_ url: URL) async throws
     /// Déplace dans la Corbeille par le Finder, qui demande le mot de passe si nécessaire
     /// et dispose de la permission « Gestion des apps ». Lance `CleanerError.cancelled` en cas d'annulation.
@@ -69,12 +70,14 @@ extension Cleaner {
     /// 3) les éléments de l'utilisateur ; ceux qui échouent sont confiés au Finder.
     public func execute(_ selection: [Candidate], backend: any RemovalBackend) async -> RemovalOutcome {
         var log = ["", "\(Date().formatted()) — Corbeille — \(selection.count) éléments"]
+        var protectedByMacOS: [String] = []
         func outcome(_ failures: [String], cancelled: Bool = false) -> RemovalOutcome {
             let removed = Set(selection.filter(isGone).map(\.id))
             for c in selection { log.append((removed.contains(c.id) ? "CORBEILLE : " : "CONSERVÉ : ") + c.url.path) }
             log += failures.map { "ÉCHEC : " + $0 }
             if cancelled { log.append("ANNULÉ par l’utilisateur.") }
-            return RemovalOutcome(removed: removed, failures: failures, cancelled: cancelled, log: log.joined(separator: "\n"))
+            return RemovalOutcome(removed: removed, failures: failures, cancelled: cancelled,
+                                  needsFullDiskAccess: protectedByMacOS, log: log.joined(separator: "\n"))
         }
 
         // Tout est revalidé avant la première modification. Un élément refusé est écarté et
@@ -86,7 +89,8 @@ extension Cleaner {
             catch {
                 if c.kind == .app {
                     log.append("Aucune modification : " + error.localizedDescription)
-                    return RemovalOutcome(removed: [], failures: [error.localizedDescription], cancelled: false, log: log.joined(separator: "\n"))
+                    return RemovalOutcome(removed: [], failures: [error.localizedDescription], cancelled: false,
+                                          needsFullDiskAccess: [], log: log.joined(separator: "\n"))
                 }
                 failures.append(error.localizedDescription)
             }
@@ -134,14 +138,16 @@ extension Cleaner {
         for c in valid where c.kind == .file && !c.requiresAdmin {
             if Task.isCancelled { break }
             if c.launchDomain == .user { await backend.unloadUserService(c.url) }
-            do { try await backend.trash(c.url) } catch { retry.append(c) }
+            do { try await backend.trash(c.url) }
+            catch CleanerError.needsFullDiskAccess { protectedByMacOS.append(c.url.path) }
+            catch { retry.append(c) }
         }
         if !retry.isEmpty {
             do { try await backend.trashWithFinder(retry.map(\.url)) }
             catch CleanerError.cancelled { return outcome(failures, cancelled: true) }
             catch { failures.append(error.localizedDescription) }
         }
-        for c in valid where !isGone(c) && !failures.contains(where: { $0.contains(c.url.path) }) {
+        for c in valid where !isGone(c) && !protectedByMacOS.contains(c.url.path) && !failures.contains(where: { $0.contains(c.url.path) }) {
             failures.append("Toujours présent : \(c.url.path)")
         }
         return outcome(failures)

@@ -65,6 +65,9 @@ struct MainView: View {
             if let app = notice.quit {
                 Button("Quitter \(app.name)") { model.quit(app) }
             }
+            if notice.offerFullDiskAccess {
+                Button("Ouvrir les réglages") { model.openFullDiskAccessSettings() }
+            }
             Button("OK", role: .cancel) {}
         } message: { notice in Text(notice.message) }
     }

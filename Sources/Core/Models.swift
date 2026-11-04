@@ -124,12 +124,15 @@ public struct OrphanScan: Sendable {
 
 public enum CleanerError: LocalizedError, Equatable {
     case unsafe(String), changed(String), cancelled, failed(String)
+    /// macOS protège cet emplacement (conteneurs d'apps…) : « Accès complet au disque » requis.
+    case needsFullDiskAccess(String)
     public var errorDescription: String? {
         switch self {
         case .unsafe(let path): return "Chemin protégé ou hors des emplacements autorisés : \(path)"
         case .changed(let path): return "Élément modifié depuis l’analyse, relance l’analyse : \(path)"
         case .cancelled: return "Authentification annulée."
         case .failed(let message): return message
+        case .needsFullDiskAccess(let path): return "Protégé par macOS (Accès complet au disque requis) : \(path)"
         }
     }
 }
@@ -139,5 +142,7 @@ public struct RemovalOutcome: Sendable {
     public let removed: Set<String>
     public let failures: [String]
     public let cancelled: Bool
+    /// Éléments bloqués par la protection des données de macOS.
+    public let needsFullDiskAccess: [String]
     public let log: String
 }

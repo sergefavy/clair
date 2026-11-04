@@ -6,6 +6,7 @@ struct Notice: Identifiable {
     let title: String
     let message: String
     var quit: InstalledApp?
+    var offerFullDiskAccess = false
 }
 
 @MainActor final class Model: ObservableObject {
@@ -164,8 +165,13 @@ struct Notice: Identifiable {
             var message = "\(moved) élément\(moved > 1 ? "s" : "") sur \(selection.count) dans la Corbeille."
             if outcome.cancelled { message = "Opération annulée. " + message }
             if !outcome.failures.isEmpty { message += "\n\n" + outcome.failures.prefix(5).joined(separator: "\n") }
+            let blocked = outcome.needsFullDiskAccess.count
+            if blocked > 0 {
+                message += "\n\n\(blocked) élément\(blocked > 1 ? "s sont protégés" : " est protégé") par macOS (conteneurs d’applications). "
+                    + "Pour les retirer, donne à Clair l’« Accès complet au disque » dans Réglages Système, puis relance Clair et recommence."
+            }
             if moved > 0 { message += "\n\nTu peux les récupérer tant que la Corbeille n’est pas vidée." }
-            let title = outcome.failures.isEmpty && !outcome.cancelled ? "C’est fait" : "Opération incomplète"
+            let title = outcome.failures.isEmpty && !outcome.cancelled && blocked == 0 ? "C’est fait" : "Opération incomplète"
 
             switch mode {
             case .apps:
@@ -176,7 +182,7 @@ struct Notice: Identifiable {
             case .leftovers:
                 findLeftovers()
             }
-            notice = Notice(title: title, message: message)
+            notice = Notice(title: title, message: message, offerFullDiskAccess: blocked > 0)
         }
     }
 
@@ -187,6 +193,12 @@ struct Notice: Identifiable {
             try journal.write(to: Self.journalURL, atomically: true, encoding: .utf8)
         } catch {
             journal += "Échec d’enregistrement du journal : \(error.localizedDescription)\n"
+        }
+    }
+
+    func openFullDiskAccessSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+            NSWorkspace.shared.open(url)
         }
     }
 
